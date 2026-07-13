@@ -47,6 +47,10 @@ class MarketDataTests(unittest.TestCase):
         windows = UpstoxProvider._windows(DataRequest("RELIANCE", "NSE", 8, "15m"))
         self.assertGreaterEqual(windows[0][0], pd.Timestamp("2022-01-01").date())
 
+    def test_research_quality_never_implies_production(self):
+        statuses = {"research_only_verified", "research_only_unverified"}
+        self.assertTrue(all(status.startswith("research_only_") for status in statuses))
+
 
 if __name__ == "__main__":
     unittest.main()

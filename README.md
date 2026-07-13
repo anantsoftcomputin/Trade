@@ -45,9 +45,12 @@ MARKET_DATA_BUCKET=trade-56777.firebasestorage.app
 ENABLE_NSE_RECONCILIATION=true
 NSE_VERIFY_SESSIONS=5
 ENABLE_YAHOO_RECONCILIATION=false
+ALLOW_YAHOO_RESEARCH_PRIMARY=false
 ```
 
 Upstox is the required primary source. NSE public UDiFF bhavcopies verify recent NSE daily closes. Yahoo is an unofficial, research-only comparison source and is disabled by default. A missing secondary source leaves a dataset `research_only_unverified`; a material cross-source mismatch quarantines the run. Neither secondary source silently replaces Upstox history.
+
+While Upstox account activation is pending, daily research runs may explicitly set `ALLOW_YAHOO_RESEARCH_PRIMARY=true`. These snapshots use Yahoo adjusted-close factors, are permanently marked `research_only_*`, set `productionEligible=false`, and cannot approve a model for advice or automated trading. Intraday Yahoo-primary runs remain disabled. Remove this flag as soon as the Upstox Analytics Token is connected.
 
 ## Recommended production architecture
 

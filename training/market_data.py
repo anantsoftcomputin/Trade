@@ -229,7 +229,7 @@ class NSEBhavcopyProvider:
 
 
 class YahooReconciliationProvider:
-    """Unofficial, research-only validator. Disabled unless explicitly enabled."""
+    """Unofficial, research-only source. Never eligible for production approval."""
 
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
@@ -249,13 +249,32 @@ class YahooReconciliationProvider:
         response.raise_for_status()
         result = response.json()["chart"]["result"][0]
         quote_data = result["indicators"]["quote"][0]
+        adjusted_data = result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", [])
         rows = [
             [datetime.fromtimestamp(ts, timezone.utc), opn, high, low, close, volume]
             for ts, opn, high, low, close, volume in zip(
                 result["timestamp"], quote_data["open"], quote_data["high"], quote_data["low"], quote_data["close"], quote_data["volume"]
             )
         ]
-        return SourceResult("yahoo_research", _canonical_frame(rows), [_sha256(response.content)], {"ticker": ticker, "researchOnly": True})
+        frame = _canonical_frame(rows)
+        adjusted_by_time = {
+            pd.to_datetime(datetime.fromtimestamp(ts, timezone.utc), utc=True): value
+            for ts, value in zip(result["timestamp"], adjusted_data)
+            if value is not None
+        }
+        adjusted_close = frame["timestamp"].map(adjusted_by_time)
+        factor = (adjusted_close / frame["close"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        frame["adjustment_factor"] = factor
+        for column in ("open", "high", "low", "close"):
+            frame[f"adjusted_{column}"] = frame[column] * factor
+        # Yahoo's factor may include cash dividends, which must not rescale share volume.
+        frame["adjusted_volume"] = frame["volume"]
+        return SourceResult(
+            "yahoo_research",
+            frame,
+            [_sha256(response.content)],
+            {"ticker": ticker, "researchOnly": True, "adjustmentSource": "yahoo_adjclose"},
+        )
 
 
 def _action_text(action: dict[str, Any]) -> str:
@@ -326,21 +345,36 @@ class MarketDataPipeline:
     async def build(self, request: DataRequest) -> Dataset:
         timeout = httpx.Timeout(60, connect=15)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            upstox = UpstoxProvider(self.upstox_token, client)
-            instrument = await upstox.resolve(request)
-            primary = await upstox.candles(request, instrument)
+            research_primary = not self.upstox_token and os.getenv("ALLOW_YAHOO_RESEARCH_PRIMARY", "false").lower() == "true"
+            if research_primary:
+                if request.timeframe != "1d":
+                    raise MarketDataError("YAHOO_RESEARCH_PRIMARY_SUPPORTS_DAILY_ONLY")
+                primary = await YahooReconciliationProvider(client).candles(request)
+                instrument = Instrument(request.symbol, request.exchange, f"YAHOO-{request.exchange}-{request.symbol}", primary.metadata["ticker"])
+                primary_source = "yahoo_research"
+            else:
+                upstox = UpstoxProvider(self.upstox_token, client)
+                instrument = await upstox.resolve(request)
+                primary = await upstox.candles(request, instrument)
+                primary_source = "upstox"
             errors = validate_ohlcv(primary.frame, request.timeframe)
             if errors:
                 raise MarketDataError("PRIMARY_DATA_VALIDATION_FAILED:" + "|".join(errors))
-            actions, action_checksum = await upstox.corporate_actions(instrument)
-            adjusted, unresolved = adjust_for_share_actions(primary.frame, actions)
-            if unresolved:
-                raise MarketDataError("UNRESOLVED_SPLIT_OR_BONUS_ACTION")
+            if research_primary:
+                actions: list[dict[str, Any]] = []
+                action_checksums: list[str] = []
+                adjusted = primary.frame.copy()
+            else:
+                actions, action_checksum = await upstox.corporate_actions(instrument)
+                action_checksums = [action_checksum]
+                adjusted, unresolved = adjust_for_share_actions(primary.frame, actions)
+                if unresolved:
+                    raise MarketDataError("UNRESOLVED_SPLIT_OR_BONUS_ACTION")
 
             verification_sources: list[SourceResult] = []
             if os.getenv("ENABLE_NSE_RECONCILIATION", "true").lower() == "true":
                 verification_sources.append(await NSEBhavcopyProvider(client, int(os.getenv("NSE_VERIFY_SESSIONS", "5"))).candles(request))
-            if os.getenv("ENABLE_YAHOO_RECONCILIATION", "false").lower() == "true":
+            if not research_primary and os.getenv("ENABLE_YAHOO_RECONCILIATION", "false").lower() == "true":
                 try:
                     verification_sources.append(await YahooReconciliationProvider(client).candles(request))
                 except (httpx.HTTPError, KeyError, TypeError, ValueError):
@@ -349,22 +383,27 @@ class MarketDataPipeline:
         reconciliations = [reconcile(primary.frame, source) for source in verification_sources]
         if any(item.status == "failed" for item in reconciliations):
             raise MarketDataError("CROSS_SOURCE_PRICE_MISMATCH")
-        quality = "verified" if any(item.status == "passed" for item in reconciliations) else "research_only_unverified"
+        has_verification = any(item.status == "passed" for item in reconciliations)
+        if research_primary:
+            quality = "research_only_verified" if has_verification else "research_only_unverified"
+        else:
+            quality = "verified" if has_verification else "research_only_unverified"
         generated = datetime.now(timezone.utc)
         manifest = {
             "schemaVersion": 1,
             "generatedAt": generated.isoformat(),
             "request": asdict(request),
             "instrument": asdict(instrument),
-            "primarySource": "upstox",
-            "sourceChecksums": {"upstox": primary.checksums, "corporateActions": [action_checksum], **{s.source: s.checksums for s in verification_sources}},
+            "primarySource": primary_source,
+            "sourceChecksums": {primary_source: primary.checksums, "corporateActions": action_checksums, **{s.source: s.checksums for s in verification_sources}},
             "reconciliation": [asdict(item) for item in reconciliations],
             "qualityStatus": quality,
             "adjustments": {
                 "corporateActionsReceived": len(actions),
                 "hasShareAdjustments": bool((adjusted["adjustment_factor"] != 1.0).any()),
-                "dividendsApplied": False,
+                "dividendsApplied": research_primary,
             },
+            "productionEligible": False if research_primary else quality == "verified",
             "rows": len(adjusted),
             "firstTimestamp": adjusted.timestamp.min().isoformat(),
             "lastTimestamp": adjusted.timestamp.max().isoformat(),
