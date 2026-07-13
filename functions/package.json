@@ -1,0 +1,9 @@
+{
+  "name": "arthai-functions",
+  "private": true,
+  "main": "lib/index.js",
+  "engines": { "node": "22" },
+  "scripts": { "build": "tsc", "lint": "oxlint src", "serve": "npm run build && firebase emulators:start --only functions", "deploy": "firebase deploy --only functions" },
+  "dependencies": { "firebase-admin": "^13.5.0", "firebase-functions": "^7.0.0", "google-auth-library": "^10.3.0", "zod": "^4.0.0" },
+  "devDependencies": { "typescript": "^6.0.2", "oxlint": "^1.71.1" }
+}
