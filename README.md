@@ -6,8 +6,8 @@ ArthAI is a responsive PWA for risk-first NSE/BSE stock research. The authentica
 
 - Live: Hosting, PWA, email/password and Google Authentication, Analytics, Firestore, Cloud Storage, owner-only rules, indexes and paper-trade persistence.
 - Live: second-generation `startTraining` callable Function and the Firestore/Eventarc `dispatchTraining` function in `asia-south1`. Artifact images have a seven-day cleanup policy.
-- Ready but not deployed: the private Cloud Run ANN/GA worker. Deploy it only after licensed provider credentials and the cost/benchmark datasets are available.
-- Implemented but awaiting credentials: Upstox V3 historical candles and corporate actions, recent NSE UDiFF bhavcopy reconciliation, optional research-only Yahoo reconciliation, validation and immutable Parquet snapshots.
+- Live: the private `arthai-training` Cloud Run worker in `asia-south1`, using a dedicated least-privilege service account. It currently accepts daily Yahoo research jobs, validates the data and writes immutable Parquet snapshots to Storage.
+- Implemented but awaiting credentials: Upstox V3 historical candles and corporate actions. Recent NSE UDiFF bhavcopy reconciliation and Yahoo research history are active for temporary research runs.
 - Awaiting external inputs: an Upstox read-only Analytics Token, a complete Indian transaction-cost schedule, benchmark/regime series and future Groww credentials.
 
 The system intentionally fails closed when these inputs are unavailable. It never substitutes scraped or synthetic prices for a real training decision.

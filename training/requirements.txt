@@ -7,4 +7,4 @@ numpy==2.3.2
 pandas==2.3.1
 pyarrow==20.0.0
 scikit-learn==1.7.1
-torch==2.7.1
+torch @ https://download.pytorch.org/whl/cpu/torch-2.7.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
