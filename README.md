@@ -1,14 +1,15 @@
 # ArthAI
 
-ArthAI is a responsive PWA for risk-first NSE/BSE stock research. The authenticated application is live at https://trade-56777.web.app. Firebase Authentication, Analytics, Firestore persistence, restrictive rules, indexes and Hosting are configured. Market charts and example model cards remain explicitly labelled demo data until licensed provider credentials are supplied.
+ArthAI is a responsive PWA for risk-first NSE/BSE stock research. The authenticated application is live at https://trade-56777.web.app. Firebase Authentication, Analytics, Firestore persistence, restrictive rules, indexes and Hosting are configured. Model cards, signals, advisor conversations and paper trades are read from owner-scoped Firestore records; fabricated model results are not shown.
 
 ### Current deployment boundary
 
 - Live: Hosting, PWA, email/password and Google Authentication, Analytics, Firestore, Cloud Storage, owner-only rules, indexes and paper-trade persistence.
 - Live: second-generation `startTraining` callable Function and the Firestore/Eventarc `dispatchTraining` function in `asia-south1`. Artifact images have a seven-day cleanup policy.
-- Live: the private `arthai-training` Cloud Run worker in `asia-south1`, using a dedicated least-privilege service account. It currently accepts daily Yahoo research jobs, validates the data and writes immutable Parquet snapshots to Storage.
+- Live: the private `arthai-training` Cloud Run worker in `asia-south1`, using a dedicated least-privilege service account. It accepts daily Yahoo research jobs, validates the data and writes immutable Parquet snapshots to Storage.
 - Implemented but awaiting credentials: Upstox V3 historical candles and corporate actions. Recent NSE UDiFF bhavcopy reconciliation and Yahoo research history are active for temporary research runs.
-- Awaiting external inputs: an Upstox read-only Analytics Token, a complete Indian transaction-cost schedule, benchmark/regime series and future Groww credentials.
+- Implemented: configurable Indian cash-equity costs, NIFTY benchmark/regime features, TCN–BiGRU–attention training, GA policy search, expanding walk-forward folds, a locked test, model registry, approval gates, daily signals, grounded Gemini tools and paper-trade monitoring.
+- Awaiting external inputs: an Upstox read-only Analytics Token, broker-specific cost overrides and future Groww credentials.
 
 The system intentionally fails closed when these inputs are unavailable. It never substitutes scraped or synthetic prices for a real training decision.
 
@@ -46,11 +47,20 @@ ENABLE_NSE_RECONCILIATION=true
 NSE_VERIFY_SESSIONS=5
 ENABLE_YAHOO_RECONCILIATION=false
 ALLOW_YAHOO_RESEARCH_PRIMARY=false
+TORCH_NUM_THREADS=2
 ```
 
 Upstox is the required primary source. NSE public UDiFF bhavcopies verify recent NSE daily closes. Yahoo is an unofficial, research-only comparison source and is disabled by default. A missing secondary source leaves a dataset `research_only_unverified`; a material cross-source mismatch quarantines the run. Neither secondary source silently replaces Upstox history.
 
-While Upstox account activation is pending, daily research runs may explicitly set `ALLOW_YAHOO_RESEARCH_PRIMARY=true`. These snapshots use Yahoo adjusted-close factors, are permanently marked `research_only_*`, set `productionEligible=false`, and cannot approve a model for advice or automated trading. Intraday Yahoo-primary runs remain disabled. Remove this flag as soon as the Upstox Analytics Token is connected.
+While Upstox account activation is pending, daily research runs may explicitly set `ALLOW_YAHOO_RESEARCH_PRIMARY=true`. These snapshots use Yahoo adjusted-close factors, are permanently marked `research_only_*` and set `productionEligible=false`. A quantitatively valid model may be released only to paper research; live advice/order automation remains prohibited. Intraday Yahoo-primary runs remain disabled. Remove this flag as soon as the Upstox Analytics Token is connected.
+
+### Research, signals and advisor
+
+Each training run versions its dataset, NIFTY benchmark, cost schedule, seeds, selected features, GA champion, locked-test metrics and gate results. A registered model has either `paper_approved` or `rejected` release status. Rejected models generate `ABSTAIN`, never a tradable recommendation.
+
+The weekday 18:30 Asia/Kolkata scheduler generates end-of-day signals for paper-approved models and marks planned/open paper trades against the latest daily candle. The advisor runs server-side on Vertex AI Gemini and must use owner-scoped tools for model cards, backtests, signals, signal history and position sizing. Gemini explains structured results but cannot create or modify signal fields.
+
+Default costs are configurable with `COST_BROKERAGE_RATE`, `COST_BROKERAGE_CAP`, `COST_STT_BUY`, `COST_STT_SELL`, `COST_EXCHANGE_RATE`, `COST_SEBI_RATE`, `COST_STAMP_BUY`, `COST_GST_RATE` and `COST_SLIPPAGE_BPS` Cloud Run environment variables.
 
 ## Recommended production architecture
 
@@ -95,19 +105,17 @@ Validation should use purged, embargoed walk-forward folds and report net return
 - Start with advisory research and paper trading. Live automation needs explicit user confirmation, broker-side risk limits, idempotent orders, kill switches, reconciliation and a complete audit log.
 - The UI must distinguish delayed, end-of-day and live data and show the exact data timestamp on every answer.
 
-## Initial Firestore shape
+## Firestore shape
 
 ```text
 users/{uid}
-workspaces/{workspaceId}
-workspaces/{workspaceId}/instruments/{instrumentId}
-workspaces/{workspaceId}/experiments/{experimentId}
-workspaces/{workspaceId}/models/{modelId}
-workspaces/{workspaceId}/signals/{signalId}
-workspaces/{workspaceId}/paperTrades/{tradeId}
-workspaces/{workspaceId}/conversations/{conversationId}
-jobs/{jobId}
+trainingJobs/{jobId}
+models/{modelId}
+signals/{signalId}
+paperTrades/{tradeId}
+conversations/{conversationId}
 auditEvents/{eventId}
+rateLimits/{uid_action}
 ```
 
 Use security rules that authorize through workspace membership and immutable server-created fields for metrics, artifacts, signal evidence and audits.

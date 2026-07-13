@@ -50,6 +50,7 @@ def fitness(metrics: dict[str, float]) -> float:
         - metrics['fold_instability'] * 1.4
         - metrics['slippage_decay'] * 0.8
         - metrics['turnover'] * 0.05
+        - metrics.get('complexity', 0.0) * 0.15
     )
 
 
@@ -67,9 +68,9 @@ def evolve(initial: Iterable[Candidate], evaluate, generations: int = 24, seed: 
             a, b = rng.choice(elites, 2, replace=True)
             mask = tuple(x if rng.random() < .5 else y for x, y in zip(a.feature_mask, b.feature_mask))
             child = Candidate(
-                width=int(rng.choice([a.width, b.width, 48, 64, 96])),
+                width=int(rng.choice([a.width, b.width, 24, 32, 48])),
                 dropout=float(np.clip((a.dropout+b.dropout)/2+rng.normal(0,.03), .08, .4)),
-                lookback=int(rng.choice([a.lookback, b.lookback, 40, 60, 90, 120])),
+                lookback=int(rng.choice([a.lookback, b.lookback, 30, 45, 60, 90])),
                 threshold=float(np.clip((a.threshold+b.threshold)/2+rng.normal(0,.01), .52, .75)),
                 stop_atr=float(np.clip((a.stop_atr+b.stop_atr)/2+rng.normal(0,.1), 1, 4)),
                 target_atr=float(np.clip((a.target_atr+b.target_atr)/2+rng.normal(0,.15), 1.5, 8)),

@@ -3,20 +3,6 @@ service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
     function ownsExisting() { return signedIn() && resource.data.ownerId == request.auth.uid; }
-    function ownsNew() { return signedIn() && request.resource.data.ownerId == request.auth.uid; }
-    function immutable(fields) { return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields); }
-    function validPaperTrade() {
-      return request.resource.data.keys().hasOnly(['ownerId','symbol','exchange','entry','stop','target','quantity','confidence','modelVersion','status','source','createdAt','updatedAt'])
-        && request.resource.data.symbol is string
-        && request.resource.data.exchange in ['NSE', 'BSE']
-        && request.resource.data.entry is number && request.resource.data.entry > 0
-        && request.resource.data.stop is number && request.resource.data.stop > 0
-        && request.resource.data.target is number && request.resource.data.target > 0
-        && request.resource.data.quantity is int && request.resource.data.quantity > 0 && request.resource.data.quantity <= 1000000
-        && request.resource.data.confidence is number && request.resource.data.confidence >= 0 && request.resource.data.confidence <= 100
-        && request.resource.data.status in ['planned','open','closed','cancelled']
-        && request.resource.data.source == 'advisor';
-    }
 
     match /users/{uid} {
       allow read, create, update: if signedIn() && request.auth.uid == uid;
@@ -36,16 +22,11 @@ service cloud.firestore {
     }
     match /paperTrades/{tradeId} {
       allow read: if ownsExisting();
-      allow create: if ownsNew() && validPaperTrade();
-      allow update: if ownsExisting() && ownsNew() && validPaperTrade()
-        && immutable(['ownerId', 'symbol', 'exchange', 'modelVersion', 'source', 'createdAt']);
-      allow delete: if ownsExisting();
+      allow write: if false;
     }
     match /conversations/{conversationId} {
       allow read: if ownsExisting();
-      allow create: if ownsNew();
-      allow update: if ownsExisting() && ownsNew() && immutable(['ownerId', 'createdAt']);
-      allow delete: if ownsExisting();
+      allow write: if false;
     }
     match /auditEvents/{eventId} {
       allow read: if ownsExisting();
