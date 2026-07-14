@@ -21,6 +21,7 @@ const trainingInput = z.object({
   timeframe: z.literal('1d'),
 })
 const signalInput = z.object({ modelId: z.string().min(10).max(40), capital: z.number().min(1_000).max(1_000_000_000).default(100_000), riskPct: z.number().min(.1).max(5).default(1) })
+const historyInput = z.object({ modelId: z.string().min(10).max(40), years: z.number().int().min(1).max(5).default(1) })
 const advisorInput = z.object({ modelId: z.string().min(10).max(40), question: z.string().trim().min(2).max(1200), conversationId: z.string().min(10).max(40).optional() })
 
 async function runner(path: string, data: unknown, timeout = 540_000) {
@@ -51,8 +52,7 @@ export const startTraining = onCall({ region, timeoutSeconds: 30, memory: '256Mi
   const parsed = trainingInput.safeParse(request.data)
   if (!parsed.success) throw new HttpsError('invalid-argument', 'Only valid daily NSE/BSE research jobs are currently supported.')
   const uid = request.auth.uid
-  const recent = await db.collection('trainingJobs').where('ownerId', '==', uid).where('createdAt', '>=', new Date(Date.now() - 60_000)).limit(3).get()
-  if (recent.size >= 3) throw new HttpsError('resource-exhausted', 'Please wait before starting another training job.')
+  await enforceRateLimit(uid, 'training', 3, 60_000)
   const job = db.collection('trainingJobs').doc()
   const now = FieldValue.serverTimestamp()
   await db.runTransaction(async tx => {
@@ -60,6 +60,22 @@ export const startTraining = onCall({ region, timeoutSeconds: 30, memory: '256Mi
     tx.create(db.collection('auditEvents').doc(), { ownerId: uid, actorId: uid, action: 'training.requested', targetId: job.id, createdAt: now, metadata: { symbol: parsed.data.symbol, exchange: parsed.data.exchange } })
   })
   return { jobId: job.id, status: 'queued' }
+})
+
+export const getMarketHistory = onCall({ region, timeoutSeconds: 120, memory: '256MiB', maxInstances: 10 }, async request => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Sign in first.')
+  await enforceRateLimit(request.auth.uid, 'history', 10, 60_000)
+  const parsed = historyInput.safeParse(request.data)
+  if (!parsed.success) throw new HttpsError('invalid-argument', 'Invalid chart request.')
+  const model = await db.collection('models').doc(parsed.data.modelId).get()
+  const value = model.data()
+  if (!model.exists || value?.ownerId !== request.auth.uid) throw new HttpsError('not-found', 'Model not found.')
+  try {
+    return await runner('/history', { symbol: value.symbol, exchange: value.exchange, years: parsed.data.years }, 120_000)
+  } catch (error) {
+    logger.error('Market history failed', { modelId: parsed.data.modelId, error })
+    throw new HttpsError('unavailable', 'Historical candles are temporarily unavailable.')
+  }
 })
 
 export const dispatchTraining = onDocumentCreated({ document: 'trainingJobs/{jobId}', region, timeoutSeconds: 540, memory: '512MiB', maxInstances: 4, retry: false }, async event => {

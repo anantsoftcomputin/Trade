@@ -30,6 +30,14 @@ export type PaperTrade = {
 
 export type Conversation = { id: string; modelId: string; messages: Array<{ role: 'user'|'assistant'; text: string; createdAt: string }>; updatedAt?: unknown }
 
+export type MarketCandle = { time: string; open: number; high: number; low: number; close: number; volume: number }
+export type MarketHistory = {
+  symbol: string; exchange: 'NSE'|'BSE'; years: number; source: string; dataQuality: string; asOf: string
+  candles: MarketCandle[]
+  summary: { last: number; periodReturn: number; periodHigh: number; periodLow: number; support20: number; resistance20: number; averageVolume20: number }
+  indicators: { rsi14: number; macdPct: number; atr: number; atrPct: number; relativeStrength20Pct: number; volumeZ: number; regime: -1|0|1 }
+}
+
 function watchOwnerCollection<T extends { id: string }>(name: string, uid: string, dateField: string, callback: (items: T[]) => void): Unsubscribe {
   if (!db) return () => undefined
   const statement = query(collection(db, name), where('ownerId', '==', uid), orderBy(dateField, 'desc'))
@@ -64,4 +72,10 @@ export async function addSignalToPaper(signalId: string) {
   if (!functions) throw new Error('Firebase Functions is not configured')
   const call = httpsCallable<{ signalId: string }, { tradeId: string; status: string }>(functions, 'createPaperTradeFromSignal')
   return (await call({ signalId })).data
+}
+
+export async function getMarketHistory(input: { modelId: string; years: number }) {
+  if (!functions) throw new Error('Firebase Functions is not configured')
+  const call = httpsCallable<typeof input, MarketHistory>(functions, 'getMarketHistory')
+  return (await call(input)).data
 }

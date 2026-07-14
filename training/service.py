@@ -48,6 +48,12 @@ class SignalRequest(BaseModel):
     riskPct: float = Field(default=1.0, ge=.1, le=5)
 
 
+class HistoryRequest(BaseModel):
+    symbol: str = Field(pattern=r"^[A-Z0-9&-]{1,24}$")
+    exchange: Literal["NSE", "BSE"]
+    years: int = Field(default=1, ge=1, le=5)
+
+
 def update(job_id: str, **values):
     values["updatedAt"] = datetime.now(timezone.utc)
     db.collection("trainingJobs").document(job_id).update(values)
@@ -64,6 +70,47 @@ async def market_frames(symbol: str, exchange: str, years: int) -> tuple[pd.Data
     async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15), follow_redirects=True) as client:
         benchmark = await fetch_yahoo_benchmark(client, years, "^NSEI" if exchange == "NSE" else "^BSESN")
     return stock, benchmark, dataset.manifest, artifact
+
+
+async def history_payload(request: HistoryRequest) -> dict:
+    pipeline = MarketDataPipeline(os.getenv("UPSTOX_ANALYTICS_TOKEN", ""), bucket_name)
+    validation_years = max(4, request.years)
+    dataset = await pipeline.build(DataRequest(request.symbol, request.exchange, validation_years, "1d"))
+    stock = dataset.frame.copy()
+    for column in ("open", "high", "low", "close"):
+        stock[column] = stock[f"adjusted_{column}"]
+    stock["volume"] = stock["adjusted_volume"]
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15), follow_redirects=True) as client:
+        benchmark = await fetch_yahoo_benchmark(client, validation_years, "^NSEI" if request.exchange == "NSE" else "^BSESN")
+    research = build_feature_frame(stock, benchmark, include_targets=False)
+    latest = research.iloc[-1]
+    visible = stock.dropna(subset=["open", "high", "low", "close", "volume"]).tail(request.years * 270)
+    candles = [{
+        "time": row.timestamp.date().isoformat(),
+        "open": round(float(row.open), 2), "high": round(float(row.high), 2),
+        "low": round(float(row.low), 2), "close": round(float(row.close), 2),
+        "volume": int(row.volume),
+    } for row in visible.itertuples(index=False)]
+    recent = visible.tail(20)
+    first_close, last_close = float(visible.close.iloc[0]), float(visible.close.iloc[-1])
+    return {
+        "symbol": request.symbol, "exchange": request.exchange, "years": request.years,
+        "source": dataset.manifest["primarySource"], "dataQuality": dataset.manifest["qualityStatus"],
+        "asOf": visible.timestamp.iloc[-1].isoformat(), "candles": candles,
+        "summary": {
+            "last": round(last_close, 2), "periodReturn": float(last_close / first_close - 1),
+            "periodHigh": round(float(visible.high.max()), 2), "periodLow": round(float(visible.low.min()), 2),
+            "support20": round(float(recent.low.min()), 2), "resistance20": round(float(recent.high.max()), 2),
+            "averageVolume20": round(float(recent.volume.mean())),
+        },
+        "indicators": {
+            "rsi14": round(float(latest.rsi_14 * 50 + 50), 2),
+            "macdPct": round(float(latest.macd * 100), 3),
+            "atr": round(float(latest.atr), 2), "atrPct": round(float(latest.atr_pct * 100), 2),
+            "relativeStrength20Pct": round(float(latest.relative_strength_20 * 100), 2),
+            "volumeZ": round(float(latest.volume_z), 2), "regime": int(latest.regime),
+        },
+    }
 
 
 def initial_population(feature_count: int, seed: int = 42, size: int = GA_POPULATION) -> list[Candidate]:
@@ -308,6 +355,14 @@ async def train(job: Job):
 async def signal(request: SignalRequest):
     try:
         return await create_signal(request)
+    except Exception as error:
+        raise HTTPException(422, str(error)[:120]) from error
+
+
+@app.post("/history")
+async def history(request: HistoryRequest):
+    try:
+        return await history_payload(request)
     except Exception as error:
         raise HTTPException(422, str(error)[:120]) from error
 

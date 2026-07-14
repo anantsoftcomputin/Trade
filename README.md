@@ -22,6 +22,8 @@ npm run dev
 
 Firebase client configuration is stored in the ignored `.env.local`; `.env.example` documents required keys. A production build is created with `npm run build`.
 
+Local Vite development uses the deployed authenticated Firebase Functions and private Cloud Run worker; the Python service does not need to run on the developer machine. Sign in, choose a company from **Train model**, and start a daily research run. When the model is registered, open its card or choose **Market Lab** to load real 1/3/5-year OHLCV candles, volume, SMA, support/resistance, momentum, volatility, relative strength, regime and data-quality metadata. No synthetic chart fallback is used: a provider failure is shown explicitly.
+
 ### Netlify
 
 Netlify builds the Vite frontend with `npm run build` and publishes `dist`; SPA redirects and production security headers are defined in `netlify.toml`. Add every `VITE_FIREBASE_*` value from `.env.example` in **Netlify → Site configuration → Environment variables**. Never upload `.env.local` or any server/provider token. After Netlify assigns the production hostname, add that hostname to **Firebase Authentication → Settings → Authorized domains** so Google and email authentication can complete.
