@@ -28,15 +28,17 @@ FEATURES = (
 class CostSchedule:
     """Configurable Indian cash-equity approximation, expressed in fractions."""
 
-    brokerage_rate: float = 0.0
-    brokerage_cap: float = 0.0
+    brokerage_rate: float = 0.025
+    brokerage_cap: float = 20.0
     stt_buy: float = 0.001
     stt_sell: float = 0.001
-    exchange_rate: float = 0.0000297
+    exchange_rate: float = 0.0000307
     sebi_rate: float = 0.000001
     stamp_buy: float = 0.00015
     gst_rate: float = 0.18
     slippage_bps: float = 5.0
+    dp_sell: float = 20.0
+    notional: float = 100_000.0
 
     @classmethod
     def from_env(cls) -> "CostSchedule":
@@ -47,14 +49,15 @@ class CostSchedule:
                 values[field] = float(os.environ[key])
         return cls(**values)
 
-    def round_trip_fraction(self, entry: float, exit_price: float, quantity: int = 1, slippage_bps: float | None = None) -> float:
+    def round_trip_fraction(self, entry: float, exit_price: float, quantity: int | None = None, slippage_bps: float | None = None) -> float:
+        quantity = quantity or max(1, int(self.notional / max(entry, 1e-9)))
         buy, sell = entry * quantity, exit_price * quantity
         brokerage_buy = min(buy * self.brokerage_rate, self.brokerage_cap) if self.brokerage_cap else buy * self.brokerage_rate
         brokerage_sell = min(sell * self.brokerage_rate, self.brokerage_cap) if self.brokerage_cap else sell * self.brokerage_rate
         exchange = (buy + sell) * self.exchange_rate
         sebi = (buy + sell) * self.sebi_rate
-        gst = (brokerage_buy + brokerage_sell + exchange + sebi) * self.gst_rate
-        statutory = brokerage_buy + brokerage_sell + buy * self.stt_buy + sell * self.stt_sell + buy * self.stamp_buy + exchange + sebi + gst
+        gst = (brokerage_buy + brokerage_sell + exchange + sebi + self.dp_sell) * self.gst_rate
+        statutory = brokerage_buy + brokerage_sell + self.dp_sell + buy * self.stt_buy + sell * self.stt_sell + buy * self.stamp_buy + exchange + sebi + gst
         slip = (buy + sell) * ((self.slippage_bps if slippage_bps is None else slippage_bps) / 10_000)
         return (statutory + slip) / max(buy, 1e-9)
 
@@ -164,10 +167,11 @@ def train_network(x_train: np.ndarray, y_direction: np.ndarray, y_return: np.nda
     random.seed(seed)
     model = TemporalAttentionModel(x_train.shape[-1], candidate.width, candidate.dropout)
     optimizer = torch.optim.AdamW(model.parameters(), lr=8e-4, weight_decay=1e-4)
-    x = torch.from_numpy(x_train.astype(np.float32))
+    safe_x = np.clip(np.nan_to_num(x_train, nan=0.0, posinf=10.0, neginf=-10.0), -10, 10)
+    x = torch.from_numpy(safe_x.astype(np.float32))
     yd = torch.from_numpy(y_direction.astype(np.float32))
-    yr = torch.from_numpy(y_return.astype(np.float32))
-    yv = torch.from_numpy(y_volatility.astype(np.float32))
+    yr = torch.from_numpy(np.clip(y_return, -.5, .5).astype(np.float32))
+    yv = torch.from_numpy(np.clip(y_volatility, 0, .25).astype(np.float32))
     model.train()
     for _ in range(epochs):
         order = torch.randperm(len(x))
@@ -176,6 +180,8 @@ def train_network(x_train: np.ndarray, y_direction: np.ndarray, y_return: np.nda
             direction, returns, volatility = model(x[batch])
             loss = nn.functional.binary_cross_entropy_with_logits(direction[:, 0], yd[batch])
             loss = loss + _pinball(returns, yr[batch]) * 8 + nn.functional.smooth_l1_loss(volatility[:, 0], yv[batch]) * 4
+            if not torch.isfinite(loss):
+                raise ValueError("NON_FINITE_TRAINING_LOSS")
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -185,25 +191,28 @@ def train_network(x_train: np.ndarray, y_direction: np.ndarray, y_return: np.nda
 
 def predict(model: TemporalAttentionModel, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     with torch.inference_mode():
-        direction, returns, volatility = model(torch.from_numpy(x.astype(np.float32)))
-    return torch.sigmoid(direction[:, 0]).numpy(), returns.numpy(), volatility[:, 0].numpy()
+        safe_x = np.clip(np.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0), -10, 10)
+        direction, returns, volatility = model(torch.from_numpy(safe_x.astype(np.float32)))
+    return torch.sigmoid(direction[:, 0]).numpy(), np.sort(returns.numpy(), axis=1), volatility[:, 0].numpy()
 
 
-def backtest(frame: pd.DataFrame, rows: np.ndarray, probability: np.ndarray, candidate: Candidate, costs: CostSchedule, horizon: int = 5, slippage_bps: float | None = None) -> dict[str, float]:
+def backtest(frame: pd.DataFrame, rows: np.ndarray, probability: np.ndarray, candidate: Candidate, costs: CostSchedule, horizon: int = 5, slippage_bps: float | None = None, expected_return: np.ndarray | None = None) -> dict[str, float]:
     trades: list[dict[str, Any]] = []
     next_allowed = -1
-    for row, prob in zip(rows, probability):
-        if row < next_allowed or prob < candidate.threshold or row + horizon >= len(frame):
+    expected_values = expected_return if expected_return is not None else np.ones(len(probability), dtype=float)
+    for row, prob, edge in zip(rows, probability, expected_values):
+        if row < next_allowed or prob < candidate.threshold or edge <= 0 or row + horizon >= len(frame):
             continue
         entry = float(frame.close.iloc[row])
         atr = float(frame.atr.iloc[row])
         stop, target = entry - candidate.stop_atr * atr, entry + candidate.target_atr * atr
         exit_price, exit_row = float(frame.close.iloc[row + horizon]), row + horizon
         for cursor in range(row + 1, row + horizon + 1):
-            if float(frame.low.iloc[cursor]) <= stop:
+            high, low = float(frame.high.iloc[cursor]), float(frame.low.iloc[cursor])
+            if low <= stop:
                 exit_price, exit_row = stop, cursor
                 break
-            if float(frame.high.iloc[cursor]) >= target:
+            if high >= target:
                 exit_price, exit_row = target, cursor
                 break
         gross = exit_price / entry - 1

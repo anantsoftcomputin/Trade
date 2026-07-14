@@ -10,7 +10,8 @@ export type TrainingJob = {
 export type ResearchModel = {
   id: string; symbol: string; exchange: 'NSE'|'BSE'; architecture: string; releaseStatus: 'paper_approved'|'rejected'
   dataQuality: string; productionEligible: false; metrics: Record<string, number>; gates: Record<string, boolean>
-  selectedFeatures: string[]; candidate: { lookback: number; threshold: number; stop_atr: number; target_atr: number }
+  selectedFeatures: string[]; candidate: { width?: number; dropout?: number; lookback: number; threshold: number; stop_atr: number; target_atr: number }
+  search?: { population: number; generations: number; folds: number; foldEpochs: number; finalEpochs: number; purgeSessions: number }
   trainedAt?: unknown
 }
 

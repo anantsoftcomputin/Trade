@@ -26,6 +26,10 @@ app = FastAPI(title="ArthAI Research Runner", docs_url=None, redoc_url=None)
 db = firestore.Client()
 bucket_name = os.getenv("MARKET_DATA_BUCKET", "")
 torch.set_num_threads(max(1, int(os.getenv("TORCH_NUM_THREADS", "2"))))
+GA_POPULATION = min(24, max(8, int(os.getenv("GA_POPULATION", "8"))))
+GA_GENERATIONS = min(20, max(3, int(os.getenv("GA_GENERATIONS", "4"))))
+GA_FOLD_EPOCHS = min(10, max(2, int(os.getenv("GA_FOLD_EPOCHS", "2"))))
+FINAL_EPOCHS = min(40, max(8, int(os.getenv("FINAL_EPOCHS", "12"))))
 
 
 class Job(BaseModel):
@@ -58,19 +62,21 @@ async def market_frames(symbol: str, exchange: str, years: int) -> tuple[pd.Data
         stock[column] = stock[f"adjusted_{column}"]
     stock["volume"] = stock["adjusted_volume"]
     async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15), follow_redirects=True) as client:
-        benchmark = await fetch_yahoo_benchmark(client, years)
+        benchmark = await fetch_yahoo_benchmark(client, years, "^NSEI" if exchange == "NSE" else "^BSESN")
     return stock, benchmark, dataset.manifest, artifact
 
 
-def initial_population(feature_count: int, seed: int = 42) -> list[Candidate]:
+def initial_population(feature_count: int, seed: int = 42, size: int = GA_POPULATION) -> list[Candidate]:
     rng = np.random.default_rng(seed)
     result = []
-    for index in range(4):
+    widths, dropouts, lookbacks = [24, 32, 48], [.1, .16, .22, .3], [30, 45, 60, 90]
+    thresholds, stops, targets = [.53, .56, .59, .63], [1.25, 1.75, 2.25, 3.0], [2.0, 3.0, 4.0, 5.5]
+    for index in range(size):
         mask = tuple(bool(value) for value in (rng.random(feature_count) > .2))
         result.append(Candidate(
-            width=[24, 32, 48][index % 3], dropout=[.12, .2, .28][index % 3],
-            lookback=[30, 45, 60][index % 3], threshold=[.54, .58, .62][index % 3],
-            stop_atr=[1.5, 2.0, 2.5][index % 3], target_atr=[2.5, 3.5, 4.5][index % 3], feature_mask=mask,
+            width=widths[index % len(widths)], dropout=dropouts[index % len(dropouts)],
+            lookback=lookbacks[index % len(lookbacks)], threshold=thresholds[index % len(thresholds)],
+            stop_atr=stops[index % len(stops)], target_atr=targets[index % len(targets)], feature_mask=mask,
         ))
     return result
 
@@ -83,22 +89,31 @@ def candidate_evaluator(frame: pd.DataFrame, costs: CostSchedule):
             return cache[candidate]
         x, yd, yr, yv, rows = sequence_arrays(frame, candidate)
         prelock = int(len(x) * .8)
-        folds = ((int(prelock * .5), int(prelock * .65)), (int(prelock * .65), prelock))
+        folds = (
+            (int(prelock * .4), int(prelock * .55)),
+            (int(prelock * .55), int(prelock * .7)),
+            (int(prelock * .7), prelock),
+        )
         fold_metrics = []
+        stressed_metrics = []
         for fold_number, (train_end, validation_end) in enumerate(folds):
             purged_train_end = max(1, train_end - 5)
             train_x, validation_x, mean, std = _scaled(x[:purged_train_end], x[train_end:validation_end])
-            network = train_network(train_x, yd[:purged_train_end], yr[:purged_train_end], yv[:purged_train_end], candidate, epochs=2, seed=100 + fold_number)
-            probability, _, _ = predict(network, validation_x)
-            fold_metrics.append(backtest(frame, rows[train_end:validation_end], probability, candidate, costs))
+            network = train_network(train_x, yd[:purged_train_end], yr[:purged_train_end], yv[:purged_train_end], candidate, epochs=GA_FOLD_EPOCHS, seed=100 + fold_number)
+            probability, expected, _ = predict(network, validation_x)
+            median = expected[:, 1]
+            fold_metrics.append(backtest(frame, rows[train_end:validation_end], probability, candidate, costs, expected_return=median))
+            stressed_metrics.append(backtest(frame, rows[train_end:validation_end], probability, candidate, costs, slippage_bps=20, expected_return=median))
         net = np.asarray([item["net_return"] for item in fold_metrics])
+        stressed_net = np.asarray([item["net_return"] for item in stressed_metrics])
         result = {
             "net_return": float(net.mean()),
             "profit_factor": float(np.mean([item["profit_factor"] for item in fold_metrics])),
             "profitable_months": float(np.mean([item["profitable_months"] for item in fold_metrics])),
-            "max_drawdown": float(np.mean([item["max_drawdown"] for item in fold_metrics])),
-            "fold_instability": float(net.std()), "slippage_decay": 0.0,
+            "max_drawdown": float(np.min([item["max_drawdown"] for item in fold_metrics])),
+            "fold_instability": float(net.std()), "slippage_decay": float(np.mean(net - stressed_net)),
             "turnover": float(np.mean([item["turnover"] for item in fold_metrics])),
+            "trades": float(np.mean([item["trades"] for item in fold_metrics])),
             "complexity": candidate.width / 100 + candidate.lookback / 500,
         }
         cache[candidate] = result
@@ -111,7 +126,7 @@ def _scaled(train: np.ndarray, other: np.ndarray):
     mean = train.reshape(-1, train.shape[-1]).mean(axis=0)
     std = train.reshape(-1, train.shape[-1]).std(axis=0)
     std[std < 1e-6] = 1
-    return (train - mean) / std, (other - mean) / std, mean, std
+    return np.clip((train - mean) / std, -10, 10), np.clip((other - mean) / std, -10, 10), mean, std
 
 
 def persist_model(owner_id: str, model_id: str, payload: bytes, metadata: dict) -> dict[str, str]:
@@ -133,15 +148,15 @@ def train_research_model(job: Job, frame: pd.DataFrame, benchmark: pd.DataFrame,
     costs = CostSchedule.from_env()
     research = build_feature_frame(frame, benchmark)
     evaluator = candidate_evaluator(research, costs)
-    champion, validation = evolve(initial_population(len(FEATURES)), evaluator, generations=2, seed=42)
+    champion, validation = evolve(initial_population(len(FEATURES)), evaluator, generations=GA_GENERATIONS, seed=42)
     x, yd, yr, yv, rows = sequence_arrays(research, champion)
     split = int(len(x) * .8)
     purged_split = split - 5
     x_train, x_test, mean, std = _scaled(x[:purged_split], x[split:])
-    model = train_network(x_train, yd[:purged_split], yr[:purged_split], yv[:purged_split], champion, epochs=8, seed=2026)
+    model = train_network(x_train, yd[:purged_split], yr[:purged_split], yv[:purged_split], champion, epochs=FINAL_EPOCHS, seed=2026)
     probability, expected, volatility = predict(model, x_test)
-    metrics = backtest(research, rows[split:], probability, champion, costs)
-    stressed = backtest(research, rows[split:], probability, champion, costs, slippage_bps=20)
+    metrics = backtest(research, rows[split:], probability, champion, costs, expected_return=expected[:, 1])
+    stressed = backtest(research, rows[split:], probability, champion, costs, slippage_bps=20, expected_return=expected[:, 1])
     first, last = int(rows[split]), int(rows[-1])
     benchmark_return = float(research.benchmark_close.iloc[last] / research.benchmark_close.iloc[first] - 1)
     buy_hold = float(research.close.iloc[last] / research.close.iloc[first] - 1 - costs.round_trip_fraction(float(research.close.iloc[first]), float(research.close.iloc[last])))
@@ -165,9 +180,10 @@ def train_research_model(job: Job, frame: pd.DataFrame, benchmark: pd.DataFrame,
         "selectedFeatures": selected_features, "metrics": metrics, "gates": gates,
         "releaseStatus": release, "dataQuality": manifest["qualityStatus"], "productionEligible": False,
         "dataset": dataset_artifact, "trainedAt": datetime.now(timezone.utc), "codeVersion": os.getenv("K_REVISION", "local"),
-        "costSchedule": asdict(costs), "benchmark": {"symbol": "^NSEI", "source": "yahoo_research"},
+        "costSchedule": asdict(costs), "benchmark": {"symbol": "^NSEI" if job.exchange == "NSE" else "^BSESN", "source": "yahoo_research"},
         "validationWindow": {"from": research.timestamp.iloc[first].isoformat(), "to": research.timestamp.iloc[last].isoformat()},
         "seeds": {"ga": 42, "finalModel": 2026},
+        "search": {"population": GA_POPULATION, "generations": GA_GENERATIONS, "folds": 3, "foldEpochs": GA_FOLD_EPOCHS, "finalEpochs": FINAL_EPOCHS, "purgeSessions": 5},
     }
     payload = serialize_artifact(model, champion, mean, std, metrics, selected_features)
     card["artifact"] = persist_model(job.ownerId, model_id, payload, card)
@@ -219,7 +235,7 @@ async def create_signal(request: SignalRequest) -> dict:
         elif bullish >= candidate.threshold and median_return > 0:
             action, reason = "BUY", "Direction probability and expected return cleared the model threshold"
         elif bullish <= 1 - candidate.threshold and median_return < 0:
-            action, reason = "SELL", "Downside probability cleared the model threshold"
+            action, reason = "SELL", "Bearish exit/avoid signal; overnight cash-equity short entry is disabled"
         else:
             action, reason = "HOLD", "The model edge is below its validated entry threshold"
     if action == "SELL":
@@ -227,7 +243,7 @@ async def create_signal(request: SignalRequest) -> dict:
     else:
         stop, target = max(.01, entry - candidate.stop_atr * atr), entry + candidate.target_atr * atr
     risk_per_share = abs(entry - stop)
-    quantity = int(min(request.capital / entry, request.capital * request.riskPct / 100 / max(risk_per_share, .01))) if action in ("BUY", "SELL") else 0
+    quantity = int(min(request.capital / entry, request.capital * request.riskPct / 100 / max(risk_per_share, .01))) if action == "BUY" else 0
     confidence = round(max(bullish, 1 - bullish) * 100, 1)
     signal_key = hashlib.sha256(f"{request.ownerId}:{request.modelId}:{current.session}:{request.capital:.2f}:{request.riskPct:.2f}".encode()).hexdigest()[:32]
     signal_ref = db.collection("signals").document(signal_key)

@@ -8,7 +8,7 @@ ArthAI is a responsive PWA for risk-first NSE/BSE stock research. The authentica
 - Live: second-generation `startTraining` callable Function and the Firestore/Eventarc `dispatchTraining` function in `asia-south1`. Artifact images have a seven-day cleanup policy.
 - Live: the private `arthai-training` Cloud Run worker in `asia-south1`, using a dedicated least-privilege service account. It accepts daily Yahoo research jobs, validates the data and writes immutable Parquet snapshots to Storage.
 - Implemented but awaiting credentials: Upstox V3 historical candles and corporate actions. Recent NSE UDiFF bhavcopy reconciliation and Yahoo research history are active for temporary research runs.
-- Implemented: configurable Indian cash-equity costs, NIFTY benchmark/regime features, TCN–BiGRU–attention training, GA policy search, expanding walk-forward folds, a locked test, model registry, approval gates, daily signals, grounded Gemini tools and paper-trade monitoring.
+- Implemented: a searchable official NIFTY 50 picker, configurable Indian cash-equity costs, NIFTY benchmark/regime features, TCN–BiGRU–attention training, mutating GA policy search, three expanding purged walk-forward folds, a locked test, model registry, approval gates, daily signals, grounded Gemini tools and paper-trade monitoring.
 - Awaiting external inputs: an Upstox read-only Analytics Token, broker-specific cost overrides and future Groww credentials.
 
 The system intentionally fails closed when these inputs are unavailable. It never substitutes scraped or synthetic prices for a real training decision.
@@ -88,9 +88,9 @@ Use a compact ensemble, not one oversized ANN:
 4. Separate heads for direction probability, expected return quantiles and volatility/risk.
 5. A calibrated meta-model that can abstain when confidence, liquidity or regime coverage is inadequate.
 
-The genetic algorithm should optimize a multi-objective fitness function across feature subsets, lookback windows, architecture width, entry/exit thresholds, stop/target policy and position sizing. Penalize drawdown, turnover, instability between folds, parameter count and slippage sensitivity. The locked test period must never influence GA selection.
+The genetic algorithm optimizes a multi-objective fitness function across feature subsets, lookback windows, architecture width/dropout, entry thresholds and stop/target policy. It penalizes drawdown, insufficient trades, turnover, instability between folds, model complexity and stressed slippage. Position sizing remains a separate user risk constraint and is not optimized on historical returns. The locked test period never influences GA selection.
 
-Validation should use purged, embargoed walk-forward folds and report net return after Indian transaction costs, maximum drawdown, profit factor, payoff ratio, profitable months, regime performance, trade count, slippage curves, worst loss streak, stability across folds and excess performance over buy-and-hold. Add calibration error and abstention coverage; do not use classification accuracy as the release gate.
+Validation uses three purged expanding walk-forward folds and reports net return after current Upstox delivery brokerage/DP/statutory costs, maximum drawdown, profit factor, payoff ratio, profitable months, regime performance, trade count, stressed slippage, worst loss streak, stability across folds and excess performance over buy-and-hold. The locked backtest and BUY generator use the same probability-plus-positive-expected-return entry rule. SELL is an exit/avoid advisory with zero quantity; multi-day naked cash-equity shorts are not simulated. Classification accuracy is not a release gate.
 
 ## Data and safety boundaries
 

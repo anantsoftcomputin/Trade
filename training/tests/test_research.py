@@ -2,8 +2,8 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from model import Candidate, TemporalAttentionModel
-from research import CostSchedule, FEATURES, approval_gates, build_feature_frame, load_artifact, serialize_artifact
+from model import Candidate, TemporalAttentionModel, evolve
+from research import CostSchedule, FEATURES, approval_gates, backtest, build_feature_frame, load_artifact, serialize_artifact
 
 
 class ResearchEngineTests(unittest.TestCase):
@@ -58,6 +58,36 @@ class ResearchEngineTests(unittest.TestCase):
         restored = load_artifact(payload)
         self.assertEqual(restored["candidate"]["lookback"], 30)
         self.assertEqual(restored["feature_names"], list(FEATURES))
+
+    def test_backtest_requires_positive_expected_return_and_does_not_short_cash_equity(self):
+        count = 40
+        close = np.linspace(120, 80, count)
+        frame = pd.DataFrame({
+            "timestamp": pd.date_range("2025-01-01", periods=count, freq="B", tz="UTC"),
+            "close": close, "high": close + .4, "low": close - .4,
+            "atr": np.ones(count), "regime": np.full(count, -1),
+        })
+        candidate = Candidate(24, .2, 10, .6, 2.0, 3.0, tuple([True] * len(FEATURES)))
+        rows = np.arange(10, 34)
+        bearish = backtest(frame, rows, np.full(len(rows), .2), candidate, CostSchedule(), expected_return=np.full(len(rows), -.02))
+        mismatched = backtest(frame, rows, np.full(len(rows), .8), candidate, CostSchedule(), expected_return=np.full(len(rows), -.02))
+        accepted = backtest(frame, rows, np.full(len(rows), .8), candidate, CostSchedule(), expected_return=np.full(len(rows), .02))
+        self.assertEqual(bearish["trades"], 0)
+        self.assertEqual(mismatched["trades"], 0)
+        self.assertGreater(accepted["trades"], 0)
+
+    def test_ga_mutates_feature_masks(self):
+        base = Candidate(24, .2, 30, .55, 1.5, 3.0, tuple([True] * len(FEATURES)))
+        seen = set()
+
+        def evaluate(candidate):
+            seen.add(candidate.feature_mask)
+            return {"net_return": .1, "profit_factor": 1.3, "profitable_months": .6,
+                    "max_drawdown": -.1, "fold_instability": .05, "slippage_decay": .01,
+                    "turnover": 20, "trades": 25, "complexity": .2}
+
+        evolve([base] * 8, evaluate, generations=4, seed=42)
+        self.assertTrue(any(mask != base.feature_mask for mask in seen))
 
 
 if __name__ == "__main__":

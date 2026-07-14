@@ -1,0 +1,61 @@
+export type StockOption = {
+  symbol: string
+  name: string
+  industry: string
+  exchange: 'NSE'
+}
+
+// NSE's official NIFTY 50 constituent file, refreshed 14 July 2026.
+// Source: https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv
+export const NIFTY_50_STOCKS: StockOption[] = [
+  ['ADANIENT', 'Adani Enterprises Ltd.', 'Metals & Mining'],
+  ['ADANIPORTS', 'Adani Ports and Special Economic Zone Ltd.', 'Services'],
+  ['APOLLOHOSP', 'Apollo Hospitals Enterprise Ltd.', 'Healthcare'],
+  ['ASIANPAINT', 'Asian Paints Ltd.', 'Consumer Durables'],
+  ['AXISBANK', 'Axis Bank Ltd.', 'Financial Services'],
+  ['BAJAJ-AUTO', 'Bajaj Auto Ltd.', 'Automobile and Auto Components'],
+  ['BAJFINANCE', 'Bajaj Finance Ltd.', 'Financial Services'],
+  ['BAJAJFINSV', 'Bajaj Finserv Ltd.', 'Financial Services'],
+  ['BEL', 'Bharat Electronics Ltd.', 'Capital Goods'],
+  ['BHARTIARTL', 'Bharti Airtel Ltd.', 'Telecommunication'],
+  ['CIPLA', 'Cipla Ltd.', 'Healthcare'],
+  ['COALINDIA', 'Coal India Ltd.', 'Oil Gas & Consumable Fuels'],
+  ['DRREDDY', "Dr. Reddy's Laboratories Ltd.", 'Healthcare'],
+  ['EICHERMOT', 'Eicher Motors Ltd.', 'Automobile and Auto Components'],
+  ['ETERNAL', 'Eternal Ltd.', 'Consumer Services'],
+  ['GRASIM', 'Grasim Industries Ltd.', 'Construction Materials'],
+  ['HCLTECH', 'HCL Technologies Ltd.', 'Information Technology'],
+  ['HDFCBANK', 'HDFC Bank Ltd.', 'Financial Services'],
+  ['HDFCLIFE', 'HDFC Life Insurance Company Ltd.', 'Financial Services'],
+  ['HINDALCO', 'Hindalco Industries Ltd.', 'Metals & Mining'],
+  ['HINDUNILVR', 'Hindustan Unilever Ltd.', 'Fast Moving Consumer Goods'],
+  ['ICICIBANK', 'ICICI Bank Ltd.', 'Financial Services'],
+  ['ITC', 'ITC Ltd.', 'Fast Moving Consumer Goods'],
+  ['INFY', 'Infosys Ltd.', 'Information Technology'],
+  ['INDIGO', 'InterGlobe Aviation Ltd.', 'Services'],
+  ['JSWSTEEL', 'JSW Steel Ltd.', 'Metals & Mining'],
+  ['JIOFIN', 'Jio Financial Services Ltd.', 'Financial Services'],
+  ['KOTAKBANK', 'Kotak Mahindra Bank Ltd.', 'Financial Services'],
+  ['LT', 'Larsen & Toubro Ltd.', 'Construction'],
+  ['M&M', 'Mahindra & Mahindra Ltd.', 'Automobile and Auto Components'],
+  ['MARUTI', 'Maruti Suzuki India Ltd.', 'Automobile and Auto Components'],
+  ['MAXHEALTH', 'Max Healthcare Institute Ltd.', 'Healthcare'],
+  ['NTPC', 'NTPC Ltd.', 'Power'],
+  ['NESTLEIND', 'Nestle India Ltd.', 'Fast Moving Consumer Goods'],
+  ['ONGC', 'Oil & Natural Gas Corporation Ltd.', 'Oil Gas & Consumable Fuels'],
+  ['POWERGRID', 'Power Grid Corporation of India Ltd.', 'Power'],
+  ['RELIANCE', 'Reliance Industries Ltd.', 'Oil Gas & Consumable Fuels'],
+  ['SBILIFE', 'SBI Life Insurance Company Ltd.', 'Financial Services'],
+  ['SHRIRAMFIN', 'Shriram Finance Ltd.', 'Financial Services'],
+  ['SBIN', 'State Bank of India', 'Financial Services'],
+  ['SUNPHARMA', 'Sun Pharmaceutical Industries Ltd.', 'Healthcare'],
+  ['TCS', 'Tata Consultancy Services Ltd.', 'Information Technology'],
+  ['TATACONSUM', 'Tata Consumer Products Ltd.', 'Fast Moving Consumer Goods'],
+  ['TMPV', 'Tata Motors Passenger Vehicles Ltd.', 'Automobile and Auto Components'],
+  ['TATASTEEL', 'Tata Steel Ltd.', 'Metals & Mining'],
+  ['TECHM', 'Tech Mahindra Ltd.', 'Information Technology'],
+  ['TITAN', 'Titan Company Ltd.', 'Consumer Durables'],
+  ['TRENT', 'Trent Ltd.', 'Consumer Services'],
+  ['ULTRACEMCO', 'UltraTech Cement Ltd.', 'Construction Materials'],
+  ['WIPRO', 'Wipro Ltd.', 'Information Technology'],
+].map(([symbol, name, industry]) => ({ symbol, name, industry, exchange: 'NSE' as const }))

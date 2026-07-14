@@ -42,6 +42,9 @@ class Candidate:
 
 def fitness(metrics: dict[str, float]) -> float:
     """Multi-objective GA score; accuracy is intentionally absent."""
+    required = ('net_return', 'profit_factor', 'profitable_months', 'max_drawdown', 'fold_instability', 'slippage_decay', 'turnover', 'trades')
+    if not all(np.isfinite(float(metrics.get(name, np.nan))) for name in required):
+        return -1_000_000.0
     return (
         metrics['net_return'] * 2.0
         + min(metrics['profit_factor'], 3.0) * 0.35
@@ -49,7 +52,8 @@ def fitness(metrics: dict[str, float]) -> float:
         - abs(metrics['max_drawdown']) * 2.5
         - metrics['fold_instability'] * 1.4
         - metrics['slippage_decay'] * 0.8
-        - metrics['turnover'] * 0.05
+        - metrics['turnover'] * 0.002
+        - max(0.0, 20.0 - metrics['trades']) * 0.025
         - metrics.get('complexity', 0.0) * 0.15
     )
 
@@ -66,7 +70,10 @@ def evolve(initial: Iterable[Candidate], evaluate, generations: int = 24, seed: 
         children = list(elites)
         while len(children) < len(population):
             a, b = rng.choice(elites, 2, replace=True)
-            mask = tuple(x if rng.random() < .5 else y for x, y in zip(a.feature_mask, b.feature_mask))
+            mask = tuple(
+                not inherited if rng.random() < .06 else inherited
+                for inherited in (x if rng.random() < .5 else y for x, y in zip(a.feature_mask, b.feature_mask))
+            )
             child = Candidate(
                 width=int(rng.choice([a.width, b.width, 24, 32, 48])),
                 dropout=float(np.clip((a.dropout+b.dropout)/2+rng.normal(0,.03), .08, .4)),
