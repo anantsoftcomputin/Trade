@@ -22,7 +22,11 @@ const trainingInput = z.object({
 })
 const signalInput = z.object({ modelId: z.string().min(10).max(40), capital: z.number().min(1_000).max(1_000_000_000).default(100_000), riskPct: z.number().min(.1).max(5).default(1) })
 const historyInput = z.object({ modelId: z.string().min(10).max(40), years: z.number().int().min(1).max(5).default(1) })
-const advisorInput = z.object({ modelId: z.string().min(10).max(40), question: z.string().trim().min(2).max(1200), conversationId: z.string().min(10).max(40).optional() })
+const advisorInput = z.object({
+  modelId: z.string().trim().min(10).max(40),
+  question: z.string().trim().min(2).max(4_000),
+  conversationId: z.preprocess(value => value == null || value === '' ? undefined : value, z.string().trim().min(10).max(40).optional()),
+})
 
 async function runner(path: string, data: unknown, timeout = 540_000) {
   const url = runnerUrl.value()
@@ -200,7 +204,18 @@ export const askAdvisor = onCall({ region, timeoutSeconds: 120, memory: '512MiB'
   if (!request.auth) throw new HttpsError('unauthenticated', 'Sign in first.')
   await enforceRateLimit(request.auth.uid, 'advisor', 10, 60_000)
   const parsed = advisorInput.safeParse(request.data)
-  if (!parsed.success) throw new HttpsError('invalid-argument', 'Invalid advisor question.')
+  if (!parsed.success) {
+    const value = request.data && typeof request.data === 'object' ? request.data as Record<string, unknown> : {}
+    logger.warn('Invalid advisor request', {
+      fields: parsed.error.issues.map(issue => ({ path: issue.path.join('.'), code: issue.code })),
+      keys: Object.keys(value),
+      modelIdType: typeof value.modelId, modelIdLength: typeof value.modelId === 'string' ? value.modelId.length : null,
+      questionType: typeof value.question, questionLength: typeof value.question === 'string' ? value.question.length : null,
+      conversationIdType: value.conversationId == null ? 'absent' : typeof value.conversationId,
+      conversationIdLength: typeof value.conversationId === 'string' ? value.conversationId.length : null,
+    })
+    throw new HttpsError('invalid-argument', 'The advisor request was incomplete. Please reselect the model and try again.')
+  }
   const uid = request.auth.uid
   try {
     const answer = await geminiAdvisor(uid, parsed.data.modelId, parsed.data.question)

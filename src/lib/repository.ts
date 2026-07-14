@@ -65,7 +65,12 @@ export async function requestSignal(input: { modelId: string; capital: number; r
 export async function askAdvisor(input: { modelId: string; question: string; conversationId?: string }) {
   if (!functions) throw new Error('Firebase Functions is not configured')
   const call = httpsCallable<typeof input, { conversationId: string; answer: string }>(functions, 'askAdvisor')
-  return (await call(input)).data
+  const modelId = input.modelId.trim()
+  const question = input.question.trim()
+  const conversationId = input.conversationId?.trim()
+  if (modelId.length < 10) throw new Error('Please reselect a trained model.')
+  if (question.length < 2) throw new Error('Please enter a longer question.')
+  return (await call({ modelId, question, ...(conversationId ? { conversationId } : {}) })).data
 }
 
 export async function addSignalToPaper(signalId: string) {
