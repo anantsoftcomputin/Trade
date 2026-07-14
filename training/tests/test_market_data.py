@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from market_data import DataRequest, SourceResult, UpstoxProvider, _share_multiplier, adjust_for_share_actions, reconcile, validate_ohlcv
+from market_data import DataRequest, UpstoxProvider, _share_multiplier, adjust_for_share_actions, validate_ohlcv
 
 
 def frame(rows=800):
@@ -37,19 +37,13 @@ class MarketDataTests(unittest.TestCase):
         action = {"purpose": "Face Value Split (Sub-Division) - From Rs 10 Per Share To Rs 2 Per Share", "expiry_date": "2022-01-03"}
         self.assertEqual(_share_multiplier(action), 5.0)
 
-    def test_reconciliation_fails_material_difference(self):
-        secondary = frame()
-        secondary["close"] *= 1.02
-        result = reconcile(frame(), SourceResult("test", secondary))
-        self.assertEqual(result.status, "failed")
-
     def test_intraday_windows_respect_upstox_availability(self):
         windows = UpstoxProvider._windows(DataRequest("RELIANCE", "NSE", 8, "15m"))
         self.assertGreaterEqual(windows[0][0], pd.Timestamp("2022-01-01").date())
 
-    def test_research_quality_never_implies_production(self):
-        statuses = {"research_only_verified", "research_only_unverified"}
-        self.assertTrue(all(status.startswith("research_only_") for status in statuses))
+    def test_upstox_benchmark_keys_are_supported(self):
+        self.assertEqual(("NIFTY 50", "NSE_INDEX|Nifty 50"), UpstoxProvider.benchmark_instrument("NSE"))
+        self.assertEqual(("SENSEX", "BSE_INDEX|SENSEX"), UpstoxProvider.benchmark_instrument("BSE"))
 
 
 if __name__ == "__main__":

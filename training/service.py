@@ -7,7 +7,6 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Literal
 
-import httpx
 import numpy as np
 import pandas as pd
 import torch
@@ -19,7 +18,7 @@ from market_data import DataRequest, MarketDataPipeline
 from model import Candidate, TemporalAttentionModel, evolve
 from research import (
     FEATURES, CostSchedule, approval_gates, backtest, build_feature_frame,
-    fetch_yahoo_benchmark, load_artifact, NumericalTrainingError, predict, sequence_arrays,
+    load_artifact, NumericalTrainingError, predict, sequence_arrays,
     serialize_artifact, train_network,
 )
 
@@ -63,13 +62,13 @@ def update(job_id: str, **values):
 async def market_frames(symbol: str, exchange: str, years: int) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
     pipeline = MarketDataPipeline(os.getenv("UPSTOX_ANALYTICS_TOKEN", ""), bucket_name)
     dataset = await pipeline.build(DataRequest(symbol, exchange, years, "1d"))
+    benchmark, benchmark_manifest = await pipeline.benchmark(exchange, years)
+    dataset.manifest["benchmark"] = benchmark_manifest
     artifact = await asyncio.to_thread(pipeline.persist, dataset)
     stock = dataset.frame.copy()
     for column in ("open", "high", "low", "close"):
         stock[column] = stock[f"adjusted_{column}"]
     stock["volume"] = stock["adjusted_volume"]
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15), follow_redirects=True) as client:
-        benchmark = await fetch_yahoo_benchmark(client, years, "^NSEI" if exchange == "NSE" else "^BSESN")
     return stock, benchmark, dataset.manifest, artifact
 
 
@@ -77,12 +76,11 @@ async def history_payload(request: HistoryRequest) -> dict:
     pipeline = MarketDataPipeline(os.getenv("UPSTOX_ANALYTICS_TOKEN", ""), bucket_name)
     validation_years = max(4, request.years)
     dataset = await pipeline.build(DataRequest(request.symbol, request.exchange, validation_years, "1d"))
+    benchmark, _ = await pipeline.benchmark(request.exchange, validation_years)
     stock = dataset.frame.copy()
     for column in ("open", "high", "low", "close"):
         stock[column] = stock[f"adjusted_{column}"]
     stock["volume"] = stock["adjusted_volume"]
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15), follow_redirects=True) as client:
-        benchmark = await fetch_yahoo_benchmark(client, validation_years, "^NSEI" if request.exchange == "NSE" else "^BSESN")
     research = build_feature_frame(stock, benchmark, include_targets=False)
     latest = research.iloc[-1]
     visible = stock.dropna(subset=["open", "high", "low", "close", "volume"]).tail(request.years * 270)
@@ -240,7 +238,7 @@ def train_research_model(job: Job, frame: pd.DataFrame, benchmark: pd.DataFrame,
         "selectedFeatures": selected_features, "metrics": metrics, "gates": gates,
         "releaseStatus": release, "dataQuality": manifest["qualityStatus"], "productionEligible": False,
         "dataset": dataset_artifact, "trainedAt": datetime.now(timezone.utc), "codeVersion": os.getenv("K_REVISION", "local"),
-        "costSchedule": asdict(costs), "benchmark": {"symbol": "^NSEI" if job.exchange == "NSE" else "^BSESN", "source": "yahoo_research"},
+        "costSchedule": asdict(costs), "benchmark": manifest["benchmark"],
         "validationWindow": {"from": research.timestamp.iloc[first].isoformat(), "to": research.timestamp.iloc[last].isoformat()},
         "seeds": {"ga": 42, "finalModel": 2026},
         "search": {"population": GA_POPULATION, "generations": GA_GENERATIONS, "folds": 3, "foldEpochs": GA_FOLD_EPOCHS, "finalEpochs": FINAL_EPOCHS, "purgeSessions": 5},

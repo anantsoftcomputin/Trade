@@ -6,10 +6,10 @@ ArthAI is a responsive PWA for risk-first NSE/BSE stock research. The authentica
 
 - Live: Hosting, PWA, email/password and Google Authentication, Analytics, Firestore, Cloud Storage, owner-only rules, indexes and paper-trade persistence.
 - Live: second-generation `startTraining` callable Function and the Firestore/Eventarc `dispatchTraining` function in `asia-south1`. Artifact images have a seven-day cleanup policy.
-- Live: the private `arthai-training` Cloud Run worker in `asia-south1`, using a dedicated least-privilege service account. It accepts daily Yahoo research jobs, validates the data and writes immutable Parquet snapshots to Storage.
-- Implemented but awaiting credentials: Upstox V3 historical candles and corporate actions. Recent NSE UDiFF bhavcopy reconciliation and Yahoo research history are active for temporary research runs.
+- Live: the private `arthai-training` Cloud Run worker in `asia-south1`, using a dedicated least-privilege service account. It accepts authenticated Upstox daily history, validates the data and writes immutable Parquet snapshots to Storage.
+- Live: Upstox V3 stock candles, NIFTY 50/SENSEX benchmark candles and corporate actions. Training has no Yahoo or NSE-download fallback.
 - Implemented: a searchable official NIFTY 50 picker, configurable Indian cash-equity costs, NIFTY benchmark/regime features, TCN–BiGRU–attention training, mutating GA policy search, three expanding purged walk-forward folds, a locked test, model registry, approval gates, daily signals, grounded Gemini tools and paper-trade monitoring.
-- Awaiting external inputs: an Upstox read-only Analytics Token, broker-specific cost overrides and future Groww credentials.
+- Awaiting external inputs: broker-specific cost overrides and future Groww credentials. The Upstox Analytics Token is active in Secret Manager.
 
 The system intentionally fails closed when these inputs are unavailable. It never substitutes scraped or synthetic prices for a real training decision.
 
@@ -45,16 +45,10 @@ Create a read-only Upstox Analytics Token and add it to Google Secret Manager; n
 
 ```text
 MARKET_DATA_BUCKET=trade-56777.firebasestorage.app
-ENABLE_NSE_RECONCILIATION=true
-NSE_VERIFY_SESSIONS=5
-ENABLE_YAHOO_RECONCILIATION=false
-ALLOW_YAHOO_RESEARCH_PRIMARY=false
 TORCH_NUM_THREADS=2
 ```
 
-Upstox is the required primary source. NSE public UDiFF bhavcopies verify recent NSE daily closes. Yahoo is an unofficial, research-only comparison source and is disabled by default. A missing secondary source leaves a dataset `research_only_unverified`; a material cross-source mismatch quarantines the run. Neither secondary source silently replaces Upstox history.
-
-While Upstox account activation is pending, daily research runs may explicitly set `ALLOW_YAHOO_RESEARCH_PRIMARY=true`. These snapshots use Yahoo adjusted-close factors, are permanently marked `research_only_*` and set `productionEligible=false`. A quantitatively valid model may be released only to paper research; live advice/order automation remains prohibited. Intraday Yahoo-primary runs remain disabled. Remove this flag as soon as the Upstox Analytics Token is connected.
+Upstox is the sole runtime market-data source. Stock OHLCV, the NIFTY 50 or SENSEX benchmark, instrument resolution and corporate actions all use the server-side Analytics Token. Missing, expired, rate-limited or invalid Upstox data fails closed; the system never substitutes another provider. Valid datasets are labelled `upstox_validated`, while live advice/order automation remains prohibited until its separate operational and regulatory controls are implemented.
 
 ### Research, signals and advisor
 

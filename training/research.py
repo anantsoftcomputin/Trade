@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
 import numpy as np
 import pandas as pd
 import torch
@@ -63,26 +62,6 @@ class CostSchedule:
         statutory = brokerage_buy + brokerage_sell + self.dp_sell + buy * self.stt_buy + sell * self.stt_sell + buy * self.stamp_buy + exchange + sebi + gst
         slip = (buy + sell) * ((self.slippage_bps if slippage_bps is None else slippage_bps) / 10_000)
         return (statutory + slip) / max(buy, 1e-9)
-
-
-async def fetch_yahoo_benchmark(client: httpx.AsyncClient, years: int, ticker: str = "^NSEI") -> pd.DataFrame:
-    now = datetime.now(timezone.utc)
-    start = now.replace(year=max(1971, now.year - years - 1))
-    response = await client.get(
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-        params={"period1": int(start.timestamp()), "period2": int(now.timestamp()), "interval": "1d", "events": "div,splits"},
-        headers={"User-Agent": "Mozilla/5.0 ArthAIResearch/1.0"},
-    )
-    response.raise_for_status()
-    result = response.json()["chart"]["result"][0]
-    quote = result["indicators"]["quote"][0]
-    adjusted = result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", quote["close"])
-    frame = pd.DataFrame({
-        "timestamp": pd.to_datetime(result["timestamp"], unit="s", utc=True),
-        "benchmark_close": adjusted,
-        "benchmark_volume": quote.get("volume", [0] * len(adjusted)),
-    }).dropna(subset=["benchmark_close"]).sort_values("timestamp")
-    return frame.drop_duplicates("timestamp", keep="last").reset_index(drop=True)
 
 
 def _rsi(close: pd.Series, window: int = 14) -> pd.Series:

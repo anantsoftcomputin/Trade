@@ -1,9 +1,4 @@
-"""Licensed-first market-data ingestion and research-only reconciliation.
-
-Upstox is the authenticated primary source. NSE public UDiFF bhavcopies and
-Yahoo Finance are optional verification sources; neither is allowed to silently
-replace missing primary history.
-"""
+"""Authenticated Upstox-only market-data ingestion."""
 
 from __future__ import annotations
 
@@ -13,7 +8,6 @@ import io
 import json
 import os
 import re
-import zipfile
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
@@ -56,16 +50,6 @@ class SourceResult:
     frame: pd.DataFrame
     checksums: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class Reconciliation:
-    source: str
-    status: Literal["passed", "failed", "unavailable", "unsupported"]
-    overlap: int = 0
-    max_close_difference_bps: float | None = None
-    mismatches: int = 0
-    detail: str | None = None
 
 
 @dataclass
@@ -120,13 +104,26 @@ class UpstoxProvider:
         self.client = client
         self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
+    async def _get(self, url: str, **kwargs) -> httpx.Response:
+        last_error: Exception | None = None
+        for attempt in range(4):
+            try:
+                response = await self.client.get(url, headers=self.headers, **kwargs)
+                if response.status_code not in (408, 429, 500, 502, 503, 504):
+                    response.raise_for_status()
+                    return response
+                last_error = httpx.HTTPStatusError("Transient Upstox response", request=response.request, response=response)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+                last_error = error
+            if attempt < 3:
+                await asyncio.sleep(.5 * (2 ** attempt))
+        raise MarketDataError("UPSTOX_TEMPORARILY_UNAVAILABLE") from last_error
+
     async def resolve(self, request: DataRequest) -> Instrument:
-        response = await self.client.get(
+        response = await self._get(
             f"{self.base_url}/v2/instruments/search",
             params={"query": request.symbol, "exchanges": request.exchange, "segments": "EQ", "records": 30},
-            headers=self.headers,
         )
-        response.raise_for_status()
         candidates = [
             item for item in response.json().get("data", [])
             if item.get("exchange") == request.exchange
@@ -160,8 +157,7 @@ class UpstoxProvider:
         key = quote(instrument.instrument_key, safe="")
         for start, end in self._windows(request):
             url = f"{self.base_url}/v3/historical-candle/{key}/{unit}/{interval}/{end.isoformat()}/{start.isoformat()}"
-            response = await self.client.get(url, headers=self.headers)
-            response.raise_for_status()
+            response = await self._get(url)
             checksums.append(_sha256(response.content))
             for candle in response.json().get("data", {}).get("candles", []):
                 if len(candle) >= 6:
@@ -169,112 +165,22 @@ class UpstoxProvider:
         return SourceResult("upstox", _canonical_frame(rows), checksums, {"instrumentKey": instrument.instrument_key})
 
     async def corporate_actions(self, instrument: Instrument) -> tuple[list[dict[str, Any]], str]:
-        response = await self.client.get(
-            f"{self.base_url}/v2/fundamentals/{quote(instrument.isin, safe='')}/corporate-actions",
-            headers=self.headers,
-        )
-        response.raise_for_status()
+        response = await self._get(f"{self.base_url}/v2/fundamentals/{quote(instrument.isin, safe='')}/corporate-actions")
         return response.json().get("data", []), _sha256(response.content)
 
+    @staticmethod
+    def benchmark_instrument(exchange: Exchange) -> tuple[str, str]:
+        return ("NIFTY 50", "NSE_INDEX|Nifty 50") if exchange == "NSE" else ("SENSEX", "BSE_INDEX|SENSEX")
 
-class NSEBhavcopyProvider:
-    """Recent NSE verification only; public archives are not a bulk API."""
-
-    base_url = "https://nsearchives.nseindia.com/content/cm"
-
-    def __init__(self, client: httpx.AsyncClient, sessions: int = 5):
-        self.client = client
-        self.sessions = max(1, min(sessions, 20))
-        self.headers = {
-            "Accept": "application/zip,text/csv,*/*",
-            "User-Agent": "Mozilla/5.0 (compatible; ArthAIResearch/1.0; +https://trade-56777.web.app)",
-        }
-
-    async def _day(self, day: date, symbol: str) -> tuple[list[Any] | None, str | None]:
-        filename = f"BhavCopy_NSE_CM_0_0_0_{day:%Y%m%d}_F_0000.csv.zip"
-        try:
-            response = await self.client.get(f"{self.base_url}/{filename}", headers=self.headers, timeout=8)
-            if response.status_code in (403, 404):
-                return None, None
-            response.raise_for_status()
-            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-                csv_name = next(name for name in archive.namelist() if name.lower().endswith(".csv"))
-                frame = pd.read_csv(archive.open(csv_name))
-            row = frame[(frame["TckrSymb"].astype(str).str.upper() == symbol) & (frame["SctySrs"].astype(str) == "EQ")]
-            if len(row) != 1:
-                return None, _sha256(response.content)
-            item = row.iloc[0]
-            return [item["TradDt"], item["OpnPric"], item["HghPric"], item["LwPric"], item["ClsPric"], item["TtlTradgVol"]], _sha256(response.content)
-        except (httpx.HTTPError, zipfile.BadZipFile, KeyError, StopIteration, ValueError):
-            return None, None
-
-    async def candles(self, request: DataRequest) -> SourceResult:
-        if request.exchange != "NSE" or request.timeframe != "1d":
-            return SourceResult("nse_bhavcopy", pd.DataFrame(columns=CANONICAL_COLUMNS), metadata={"unsupported": True})
-        candidates: list[date] = []
-        cursor = datetime.now(timezone.utc).date() - timedelta(days=1)
-        while len(candidates) < self.sessions * 2:
-            if cursor.weekday() < 5:
-                candidates.append(cursor)
-            cursor -= timedelta(days=1)
-        results = await asyncio.gather(*(self._day(day, request.symbol) for day in candidates))
-        rows, checksums = [], []
-        for row, checksum in results:
-            if row is not None:
-                rows.append(row)
-            if checksum:
-                checksums.append(checksum)
-        rows = rows[: self.sessions]
-        return SourceResult("nse_bhavcopy", _canonical_frame(rows), checksums, {"requestedSessions": self.sessions})
-
-
-class YahooReconciliationProvider:
-    """Unofficial, research-only source. Never eligible for production approval."""
-
-    def __init__(self, client: httpx.AsyncClient):
-        self.client = client
-
-    async def candles(self, request: DataRequest) -> SourceResult:
-        if request.timeframe != "1d":
-            return SourceResult("yahoo_research", pd.DataFrame(columns=CANONICAL_COLUMNS), metadata={"unsupported": True})
-        ticker = f"{request.symbol}.{'NS' if request.exchange == 'NSE' else 'BO'}"
-        end = int(datetime.now(timezone.utc).timestamp())
-        start = int((datetime.now(timezone.utc) - timedelta(days=int(request.history_years * 365.25) + 10)).timestamp())
-        response = await self.client.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(ticker, safe='')}",
-            params={"period1": start, "period2": end, "interval": "1d", "events": "div,splits"},
-            headers={"User-Agent": "Mozilla/5.0 (compatible; ArthAIResearch/1.0)"},
-            timeout=20,
-        )
-        response.raise_for_status()
-        result = response.json()["chart"]["result"][0]
-        quote_data = result["indicators"]["quote"][0]
-        adjusted_data = result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", [])
-        rows = [
-            [datetime.fromtimestamp(ts, timezone.utc), opn, high, low, close, volume]
-            for ts, opn, high, low, close, volume in zip(
-                result["timestamp"], quote_data["open"], quote_data["high"], quote_data["low"], quote_data["close"], quote_data["volume"]
-            )
-        ]
-        frame = _canonical_frame(rows)
-        adjusted_by_time = {
-            pd.to_datetime(datetime.fromtimestamp(ts, timezone.utc), utc=True): value
-            for ts, value in zip(result["timestamp"], adjusted_data)
-            if value is not None
-        }
-        adjusted_close = frame["timestamp"].map(adjusted_by_time)
-        factor = (adjusted_close / frame["close"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-        frame["adjustment_factor"] = factor
-        for column in ("open", "high", "low", "close"):
-            frame[f"adjusted_{column}"] = frame[column] * factor
-        # Yahoo's factor may include cash dividends, which must not rescale share volume.
-        frame["adjusted_volume"] = frame["volume"]
-        return SourceResult(
-            "yahoo_research",
-            frame,
-            [_sha256(response.content)],
-            {"ticker": ticker, "researchOnly": True, "adjustmentSource": "yahoo_adjclose"},
-        )
+    async def benchmark(self, exchange: Exchange, years: int) -> tuple[pd.DataFrame, dict[str, Any]]:
+        symbol, key = self.benchmark_instrument(exchange)
+        request = DataRequest(symbol.replace(" ", ""), exchange, years, "1d")
+        result = await self.candles(request, Instrument(symbol, exchange, f"{exchange}-INDEX", key))
+        errors = validate_ohlcv(result.frame, "1d")
+        if errors:
+            raise MarketDataError("UPSTOX_BENCHMARK_VALIDATION_FAILED:" + "|".join(errors))
+        frame = result.frame[["timestamp", "close", "volume"]].rename(columns={"close": "benchmark_close", "volume": "benchmark_volume"})
+        return frame, {"source": "upstox", "symbol": symbol, "instrumentKey": key, "checksums": result.checksums}
 
 
 def _action_text(action: dict[str, Any]) -> str:
@@ -321,22 +227,6 @@ def adjust_for_share_actions(frame: pd.DataFrame, actions: list[dict[str, Any]])
     return adjusted, unresolved
 
 
-def reconcile(primary: pd.DataFrame, secondary: SourceResult, tolerance_bps: float = 50.0) -> Reconciliation:
-    if secondary.metadata.get("unsupported"):
-        return Reconciliation(secondary.source, "unsupported", detail="timeframe_or_exchange_not_supported")
-    if secondary.frame.empty:
-        return Reconciliation(secondary.source, "unavailable", detail="no_records_received")
-    left = primary.assign(day=primary["timestamp"].dt.date)[["day", "close"]]
-    right = secondary.frame.assign(day=secondary.frame["timestamp"].dt.date)[["day", "close"]]
-    overlap = left.merge(right, on="day", suffixes=("_primary", "_secondary"))
-    if overlap.empty:
-        return Reconciliation(secondary.source, "unavailable", detail="no_overlapping_sessions")
-    differences = ((overlap.close_primary / overlap.close_secondary - 1).abs() * 10_000).replace([np.inf], np.nan).dropna()
-    mismatches = int((differences > tolerance_bps).sum())
-    status: Literal["passed", "failed"] = "passed" if mismatches == 0 else "failed"
-    return Reconciliation(secondary.source, status, len(overlap), float(differences.max()), mismatches)
-
-
 class MarketDataPipeline:
     def __init__(self, upstox_token: str, bucket_name: str | None = None):
         self.upstox_token = upstox_token
@@ -345,70 +235,43 @@ class MarketDataPipeline:
     async def build(self, request: DataRequest) -> Dataset:
         timeout = httpx.Timeout(60, connect=15)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            research_primary = not self.upstox_token and os.getenv("ALLOW_YAHOO_RESEARCH_PRIMARY", "false").lower() == "true"
-            if research_primary:
-                if request.timeframe != "1d":
-                    raise MarketDataError("YAHOO_RESEARCH_PRIMARY_SUPPORTS_DAILY_ONLY")
-                primary = await YahooReconciliationProvider(client).candles(request)
-                instrument = Instrument(request.symbol, request.exchange, f"YAHOO-{request.exchange}-{request.symbol}", primary.metadata["ticker"])
-                primary_source = "yahoo_research"
-            else:
-                upstox = UpstoxProvider(self.upstox_token, client)
-                instrument = await upstox.resolve(request)
-                primary = await upstox.candles(request, instrument)
-                primary_source = "upstox"
+            upstox = UpstoxProvider(self.upstox_token, client)
+            instrument = await upstox.resolve(request)
+            primary = await upstox.candles(request, instrument)
             errors = validate_ohlcv(primary.frame, request.timeframe)
             if errors:
                 raise MarketDataError("PRIMARY_DATA_VALIDATION_FAILED:" + "|".join(errors))
-            if research_primary:
-                actions: list[dict[str, Any]] = []
-                action_checksums: list[str] = []
-                adjusted = primary.frame.copy()
-            else:
-                actions, action_checksum = await upstox.corporate_actions(instrument)
-                action_checksums = [action_checksum]
-                adjusted, unresolved = adjust_for_share_actions(primary.frame, actions)
-                if unresolved:
-                    raise MarketDataError("UNRESOLVED_SPLIT_OR_BONUS_ACTION")
-
-            verification_sources: list[SourceResult] = []
-            if os.getenv("ENABLE_NSE_RECONCILIATION", "true").lower() == "true":
-                verification_sources.append(await NSEBhavcopyProvider(client, int(os.getenv("NSE_VERIFY_SESSIONS", "5"))).candles(request))
-            if not research_primary and os.getenv("ENABLE_YAHOO_RECONCILIATION", "false").lower() == "true":
-                try:
-                    verification_sources.append(await YahooReconciliationProvider(client).candles(request))
-                except (httpx.HTTPError, KeyError, TypeError, ValueError):
-                    verification_sources.append(SourceResult("yahoo_research", pd.DataFrame(columns=CANONICAL_COLUMNS)))
-
-        reconciliations = [reconcile(primary.frame, source) for source in verification_sources]
-        if any(item.status == "failed" for item in reconciliations):
-            raise MarketDataError("CROSS_SOURCE_PRICE_MISMATCH")
-        has_verification = any(item.status == "passed" for item in reconciliations)
-        if research_primary:
-            quality = "research_only_verified" if has_verification else "research_only_unverified"
-        else:
-            quality = "verified" if has_verification else "research_only_unverified"
+            actions, action_checksum = await upstox.corporate_actions(instrument)
+            action_checksums = [action_checksum]
+            adjusted, unresolved = adjust_for_share_actions(primary.frame, actions)
+            if unresolved:
+                raise MarketDataError("UNRESOLVED_SPLIT_OR_BONUS_ACTION")
         generated = datetime.now(timezone.utc)
         manifest = {
             "schemaVersion": 1,
             "generatedAt": generated.isoformat(),
             "request": asdict(request),
             "instrument": asdict(instrument),
-            "primarySource": primary_source,
-            "sourceChecksums": {primary_source: primary.checksums, "corporateActions": action_checksums, **{s.source: s.checksums for s in verification_sources}},
-            "reconciliation": [asdict(item) for item in reconciliations],
-            "qualityStatus": quality,
+            "primarySource": "upstox",
+            "sourceChecksums": {"upstox": primary.checksums, "corporateActions": action_checksums},
+            "reconciliation": [],
+            "qualityStatus": "upstox_validated",
             "adjustments": {
                 "corporateActionsReceived": len(actions),
                 "hasShareAdjustments": bool((adjusted["adjustment_factor"] != 1.0).any()),
-                "dividendsApplied": research_primary,
+                "dividendsApplied": False,
             },
-            "productionEligible": False if research_primary else quality == "verified",
+            "productionEligible": False,
             "rows": len(adjusted),
             "firstTimestamp": adjusted.timestamp.min().isoformat(),
             "lastTimestamp": adjusted.timestamp.max().isoformat(),
         }
         return Dataset(adjusted, instrument, manifest)
+
+    async def benchmark(self, exchange: Exchange, years: int) -> tuple[pd.DataFrame, dict[str, Any]]:
+        timeout = httpx.Timeout(60, connect=15)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            return await UpstoxProvider(self.upstox_token, client).benchmark(exchange, years)
 
     def persist(self, dataset: Dataset) -> dict[str, str]:
         bucket_name = self.bucket_name or os.getenv("MARKET_DATA_BUCKET")
