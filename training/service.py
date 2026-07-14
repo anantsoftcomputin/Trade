@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Literal
@@ -18,7 +19,7 @@ from market_data import DataRequest, MarketDataPipeline
 from model import Candidate, TemporalAttentionModel, evolve
 from research import (
     FEATURES, CostSchedule, approval_gates, backtest, build_feature_frame,
-    fetch_yahoo_benchmark, load_artifact, predict, sequence_arrays,
+    fetch_yahoo_benchmark, load_artifact, NumericalTrainingError, predict, sequence_arrays,
     serialize_artifact, train_network,
 )
 
@@ -86,7 +87,7 @@ async def history_payload(request: HistoryRequest) -> dict:
     latest = research.iloc[-1]
     visible = stock.dropna(subset=["open", "high", "low", "close", "volume"]).tail(request.years * 270)
     candles = [{
-        "time": row.timestamp.date().isoformat(),
+        "time": row.timestamp.tz_convert("Asia/Kolkata").date().isoformat(),
         "open": round(float(row.open), 2), "high": round(float(row.high), 2),
         "low": round(float(row.low), 2), "close": round(float(row.close), 2),
         "volume": int(row.volume),
@@ -143,14 +144,23 @@ def candidate_evaluator(frame: pd.DataFrame, costs: CostSchedule):
         )
         fold_metrics = []
         stressed_metrics = []
-        for fold_number, (train_end, validation_end) in enumerate(folds):
-            purged_train_end = max(1, train_end - 5)
-            train_x, validation_x, mean, std = _scaled(x[:purged_train_end], x[train_end:validation_end])
-            network = train_network(train_x, yd[:purged_train_end], yr[:purged_train_end], yv[:purged_train_end], candidate, epochs=GA_FOLD_EPOCHS, seed=100 + fold_number)
-            probability, expected, _ = predict(network, validation_x)
-            median = expected[:, 1]
-            fold_metrics.append(backtest(frame, rows[train_end:validation_end], probability, candidate, costs, expected_return=median))
-            stressed_metrics.append(backtest(frame, rows[train_end:validation_end], probability, candidate, costs, slippage_bps=20, expected_return=median))
+        try:
+            for fold_number, (train_end, validation_end) in enumerate(folds):
+                purged_train_end = max(1, train_end - 5)
+                train_x, validation_x, mean, std = _scaled(x[:purged_train_end], x[train_end:validation_end])
+                network = train_network(train_x, yd[:purged_train_end], yr[:purged_train_end], yv[:purged_train_end], candidate, epochs=GA_FOLD_EPOCHS, seed=100 + fold_number)
+                probability, expected, _ = predict(network, validation_x)
+                median = expected[:, 1]
+                fold_metrics.append(backtest(frame, rows[train_end:validation_end], probability, candidate, costs, expected_return=median))
+                stressed_metrics.append(backtest(frame, rows[train_end:validation_end], probability, candidate, costs, slippage_bps=20, expected_return=median))
+        except NumericalTrainingError:
+            result = {
+                "net_return": -1.0, "profit_factor": 0.0, "profitable_months": 0.0,
+                "max_drawdown": -1.0, "fold_instability": 1.0, "slippage_decay": 1.0,
+                "turnover": 0.0, "trades": 0.0, "complexity": candidate.width / 100 + candidate.lookback / 500,
+            }
+            cache[candidate] = result
+            return result
         net = np.asarray([item["net_return"] for item in fold_metrics])
         stressed_net = np.asarray([item["net_return"] for item in stressed_metrics])
         result = {
@@ -170,18 +180,21 @@ def candidate_evaluator(frame: pd.DataFrame, costs: CostSchedule):
 
 
 def _scaled(train: np.ndarray, other: np.ndarray):
-    mean = train.reshape(-1, train.shape[-1]).mean(axis=0)
-    std = train.reshape(-1, train.shape[-1]).std(axis=0)
+    flat = train.reshape(-1, train.shape[-1]).astype(np.float64)
+    mean = np.nan_to_num(flat.mean(axis=0), nan=0.0, posinf=0.0, neginf=0.0)
+    std = np.nan_to_num(flat.std(axis=0), nan=1.0, posinf=1.0, neginf=1.0)
     std[std < 1e-6] = 1
-    return np.clip((train - mean) / std, -10, 10), np.clip((other - mean) / std, -10, 10), mean, std
+    scaled_train = np.clip(np.nan_to_num((train - mean) / std, nan=0.0, posinf=10.0, neginf=-10.0), -10, 10)
+    scaled_other = np.clip(np.nan_to_num((other - mean) / std, nan=0.0, posinf=10.0, neginf=-10.0), -10, 10)
+    return scaled_train.astype(np.float32), scaled_other.astype(np.float32), mean, std
 
 
 def persist_model(owner_id: str, model_id: str, payload: bytes, metadata: dict) -> dict[str, str]:
     bucket = storage.Client().bucket(bucket_name)
     prefix = f"model-artifacts/{owner_id}/{model_id}"
     model_path, card_path = f"{prefix}/model.pt", f"{prefix}/model-card.json"
-    bucket.blob(model_path).upload_from_string(payload, content_type="application/octet-stream")
-    bucket.blob(card_path).upload_from_string(json.dumps(metadata, sort_keys=True, default=str), content_type="application/json")
+    bucket.blob(model_path).upload_from_string(payload, content_type="application/octet-stream", if_generation_match=0)
+    bucket.blob(card_path).upload_from_string(json.dumps(metadata, sort_keys=True, default=str), content_type="application/json", if_generation_match=0)
     return {"model": f"gs://{bucket_name}/{model_path}", "modelCard": f"gs://{bucket_name}/{card_path}"}
 
 
@@ -217,8 +230,8 @@ def train_research_model(job: Job, frame: pd.DataFrame, benchmark: pd.DataFrame,
         "testSamples": float(len(x_test)), "trainSamples": float(len(x_train)),
     })
     gates, release = approval_gates(metrics, manifest["qualityStatus"])
-    model_ref = db.collection("models").document()
-    model_id = model_ref.id
+    model_id = secrets.token_urlsafe(15)
+    model_ref = db.collection("models").document(model_id)
     selected_features = [name for name, enabled in zip(FEATURES, champion.feature_mask) if enabled] or [FEATURES[0]]
     card = {
         "schemaVersion": 1, "modelId": model_id, "ownerId": job.ownerId, "symbol": job.symbol,
@@ -335,7 +348,7 @@ async def train(job: Job):
     try:
         if job.timeframe != "1d":
             raise ValueError("RESEARCH_TRAINING_SUPPORTS_DAILY_ONLY")
-        update(job.jobId, status="running", stage="provider_validation", progress=3)
+        update(job.jobId, status="running", stage="provider_validation", progress=3, errorCode=firestore.DELETE_FIELD)
         frame, benchmark, manifest, dataset = await market_frames(job.symbol, job.exchange, job.historyYears)
         update(job.jobId, stage="feature_engineering", progress=18, observations=len(frame), dataset=dataset, dataQuality=manifest["qualityStatus"], reconciliation=manifest["reconciliation"])
         update(job.jobId, stage="ga_walk_forward", progress=30)

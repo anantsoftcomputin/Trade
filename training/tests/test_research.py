@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 from model import Candidate, TemporalAttentionModel, evolve
-from research import CostSchedule, FEATURES, approval_gates, backtest, build_feature_frame, load_artifact, serialize_artifact
+from research import CostSchedule, FEATURES, approval_gates, backtest, build_feature_frame, load_artifact, predict, serialize_artifact, train_network
 
 
 class ResearchEngineTests(unittest.TestCase):
@@ -27,6 +27,16 @@ class ResearchEngineTests(unittest.TestCase):
     def test_inference_keeps_latest_rows(self):
         frame = build_feature_frame(self.stock, self.benchmark, include_targets=False)
         self.assertEqual(frame.timestamp.iloc[-1], self.stock.timestamp.iloc[-1])
+
+    def test_upstox_midnight_timestamp_joins_same_indian_session(self):
+        sessions = pd.date_range("2024-01-01", periods=420, freq="B", tz="Asia/Kolkata")
+        stock = self.stock.copy()
+        stock["timestamp"] = sessions.tz_convert("UTC")
+        benchmark = self.benchmark.copy()
+        benchmark["timestamp"] = (sessions + pd.Timedelta(hours=9, minutes=15)).tz_convert("UTC")
+        frame = build_feature_frame(stock, benchmark, include_targets=False)
+        expected = benchmark.assign(session=sessions.date).set_index("session").benchmark_close
+        self.assertEqual(frame.benchmark_close.iloc[-1], expected.loc[frame.session.iloc[-1]])
 
     def test_cost_schedule_includes_slippage_and_statutory_costs(self):
         costs = CostSchedule()
@@ -88,6 +98,20 @@ class ResearchEngineTests(unittest.TestCase):
 
         evolve([base] * 8, evaluate, generations=4, seed=42)
         self.assertTrue(any(mask != base.feature_mask for mask in seen))
+
+    def test_network_sanitizes_non_finite_training_values(self):
+        candidate = Candidate(24, .1, 5, .55, 1.5, 3.0, (True, True, True))
+        x = np.zeros((16, 5, 3), dtype=np.float32)
+        x[0, 0] = [np.nan, np.inf, -np.inf]
+        direction = np.asarray([0, 1] * 8, dtype=np.float32)
+        returns = np.linspace(-.1, .1, 16, dtype=np.float32)
+        volatility = np.full(16, .02, dtype=np.float32)
+        returns[0], volatility[1] = np.nan, np.inf
+        model = train_network(x, direction, returns, volatility, candidate, epochs=1, seed=7)
+        probability, expected, predicted_volatility = predict(model, x)
+        self.assertTrue(np.isfinite(probability).all())
+        self.assertTrue(np.isfinite(expected).all())
+        self.assertTrue(np.isfinite(predicted_volatility).all())
 
 
 if __name__ == "__main__":

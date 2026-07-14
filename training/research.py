@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import math
 import os
-import random
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -22,6 +21,10 @@ FEATURES = (
     "rsi_14", "macd", "macd_signal", "atr_pct", "benchmark_return_1",
     "benchmark_return_20", "relative_strength_20", "benchmark_ma_50", "regime",
 )
+
+
+class NumericalTrainingError(RuntimeError):
+    """A candidate became unstable and must not terminate the whole GA run."""
 
 
 @dataclass(frozen=True)
@@ -91,9 +94,9 @@ def _rsi(close: pd.Series, window: int = 14) -> pd.Series:
 
 def build_feature_frame(stock: pd.DataFrame, benchmark: pd.DataFrame, horizon: int = 5, include_targets: bool = True) -> pd.DataFrame:
     frame = stock.copy().sort_values("timestamp")
-    frame["session"] = pd.to_datetime(frame["timestamp"], utc=True).dt.date
+    frame["session"] = pd.to_datetime(frame["timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.date
     bench = benchmark.copy()
-    bench["session"] = pd.to_datetime(bench["timestamp"], utc=True).dt.date
+    bench["session"] = pd.to_datetime(bench["timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.date
     frame = frame.merge(bench[["session", "benchmark_close"]], on="session", how="left")
     frame["benchmark_close"] = frame["benchmark_close"].ffill()
     close, volume = frame["close"], frame["volume"]
@@ -162,31 +165,46 @@ def _pinball(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def train_network(x_train: np.ndarray, y_direction: np.ndarray, y_return: np.ndarray, y_volatility: np.ndarray, candidate: Candidate, epochs: int, seed: int) -> TemporalAttentionModel:
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    model = TemporalAttentionModel(x_train.shape[-1], candidate.width, candidate.dropout)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=8e-4, weight_decay=1e-4)
     safe_x = np.clip(np.nan_to_num(x_train, nan=0.0, posinf=10.0, neginf=-10.0), -10, 10)
     x = torch.from_numpy(safe_x.astype(np.float32))
-    yd = torch.from_numpy(y_direction.astype(np.float32))
-    yr = torch.from_numpy(np.clip(y_return, -.5, .5).astype(np.float32))
-    yv = torch.from_numpy(np.clip(y_volatility, 0, .25).astype(np.float32))
-    model.train()
-    for _ in range(epochs):
-        order = torch.randperm(len(x))
-        for start in range(0, len(x), 128):
-            batch = order[start:start + 128]
-            direction, returns, volatility = model(x[batch])
-            loss = nn.functional.binary_cross_entropy_with_logits(direction[:, 0], yd[batch])
-            loss = loss + _pinball(returns, yr[batch]) * 8 + nn.functional.smooth_l1_loss(volatility[:, 0], yv[batch]) * 4
-            if not torch.isfinite(loss):
-                raise ValueError("NON_FINITE_TRAINING_LOSS")
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-    return model.eval()
+    yd = torch.from_numpy(np.clip(np.nan_to_num(y_direction, nan=0.0, posinf=1.0, neginf=0.0), 0, 1).astype(np.float32))
+    yr = torch.from_numpy(np.clip(np.nan_to_num(y_return, nan=0.0, posinf=.5, neginf=-.5), -.5, .5).astype(np.float32))
+    yv = torch.from_numpy(np.clip(np.nan_to_num(y_volatility, nan=0.0, posinf=.25, neginf=0.0), 0, .25).astype(np.float32))
+    if not len(x):
+        raise NumericalTrainingError("EMPTY_TRAINING_SET")
+    for attempt, learning_rate in enumerate((8e-4, 3e-4, 1e-4)):
+        attempt_seed = seed + attempt * 10_000
+        torch.manual_seed(attempt_seed)
+        np.random.seed(attempt_seed)
+        model = TemporalAttentionModel(x_train.shape[-1], candidate.width, candidate.dropout)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+        model.train()
+        stable = True
+        for _ in range(epochs):
+            order = torch.randperm(len(x))
+            for start in range(0, len(x), 128):
+                batch = order[start:start + 128]
+                direction, returns, volatility = model(x[batch])
+                loss = nn.functional.binary_cross_entropy_with_logits(direction[:, 0], yd[batch])
+                loss = loss + _pinball(returns, yr[batch]) * 8 + nn.functional.smooth_l1_loss(volatility[:, 0], yv[batch]) * 4
+                if not torch.isfinite(loss):
+                    stable = False
+                    break
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                gradient_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=False)
+                if not torch.isfinite(gradient_norm):
+                    stable = False
+                    break
+                optimizer.step()
+                if not all(torch.isfinite(parameter).all() for parameter in model.parameters()):
+                    stable = False
+                    break
+            if not stable:
+                break
+        if stable:
+            return model.eval()
+    raise NumericalTrainingError("NON_FINITE_TRAINING_LOSS_AFTER_RETRIES")
 
 
 def predict(model: TemporalAttentionModel, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -199,6 +217,7 @@ def predict(model: TemporalAttentionModel, x: np.ndarray) -> tuple[np.ndarray, n
 def backtest(frame: pd.DataFrame, rows: np.ndarray, probability: np.ndarray, candidate: Candidate, costs: CostSchedule, horizon: int = 5, slippage_bps: float | None = None, expected_return: np.ndarray | None = None) -> dict[str, float]:
     trades: list[dict[str, Any]] = []
     next_allowed = -1
+    sessions = frame["session"] if "session" in frame else pd.to_datetime(frame["timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.date
     expected_values = expected_return if expected_return is not None else np.ones(len(probability), dtype=float)
     for row, prob, edge in zip(rows, probability, expected_values):
         if row < next_allowed or prob < candidate.threshold or edge <= 0 or row + horizon >= len(frame):
@@ -217,7 +236,7 @@ def backtest(frame: pd.DataFrame, rows: np.ndarray, probability: np.ndarray, can
                 break
         gross = exit_price / entry - 1
         net = gross - costs.round_trip_fraction(entry, exit_price, slippage_bps=slippage_bps)
-        trades.append({"return": net, "gross": gross, "month": str(frame.timestamp.iloc[exit_row])[:7], "regime": int(frame.regime.iloc[row])})
+        trades.append({"return": net, "gross": gross, "month": str(sessions.iloc[exit_row])[:7], "regime": int(frame.regime.iloc[row])})
         next_allowed = exit_row + 1
     returns = np.asarray([trade["return"] for trade in trades], dtype=float)
     if len(returns) == 0:
